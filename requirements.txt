@@ -1,0 +1,4 @@
+shioaji
+pandas
+python-dotenv
+requests
