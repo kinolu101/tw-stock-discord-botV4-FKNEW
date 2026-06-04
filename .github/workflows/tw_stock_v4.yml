@@ -1,0 +1,74 @@
+name: TW Stock Discord Bot V4
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 台灣時間 09:00 = UTC 01:00
+    # 同一個 job 會先跑 09:00，等待到 09:05，再跑 09:05
+    - cron: "0 1 * * 1-5"
+
+jobs:
+  run-stock-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      TZ: Asia/Taipei
+      DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+      SHIOAJI_API_KEY: ${{ secrets.SHIOAJI_API_KEY }}
+      SHIOAJI_SECRET_KEY: ${{ secrets.SHIOAJI_SECRET_KEY }}
+      SHIOAJI_SIMULATION: ${{ secrets.SHIOAJI_SIMULATION }}
+      MIN_CHANGE_RATE: "1.0"
+      MAX_CHANGE_RATE: "9.0"
+      MIN_VOLUME: "3000"
+      MIN_TURNOVER_TWD: "300000000"
+      TOP_N: "2"
+      TOP_PRINT_N: "20"
+      CANDIDATES_FILE: "candidates_0900.json"
+      BREAKOUTS_FILE: "breakouts_0905.json"
+      # 可自行加入台股休市日，格式：2026-01-01,2026-02-16
+      TWSE_HOLIDAYS: ${{ vars.TWSE_HOLIDAYS }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run 09:00 candidates
+        run: python run_0900_v4.py
+
+      - name: Wait until 09:05 Taiwan time
+        shell: bash
+        run: |
+          echo "Current Taiwan time: $(TZ=Asia/Taipei date '+%H:%M:%S')"
+          target=$(TZ=Asia/Taipei date -d "09:05:00" +%s)
+          now=$(TZ=Asia/Taipei date +%s)
+          if [ "$now" -lt "$target" ]; then
+            sleep_seconds=$((target - now))
+            echo "Sleep ${sleep_seconds}s until 09:05 Taiwan time"
+            sleep "$sleep_seconds"
+          else
+            echo "Already after 09:05, continue."
+          fi
+
+      - name: Run 09:05 breakouts
+        run: python run_0905_v4.py
+
+      - name: Upload result json
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tw-stock-v4-results
+          path: |
+            candidates_0900.json
+            breakouts_0905.json
+          if-no-files-found: ignore
