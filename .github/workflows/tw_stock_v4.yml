@@ -5,7 +5,7 @@ on:
   schedule:
     # 台灣時間 09:00 = UTC 01:00
     # 同一個 job 會先跑 09:00，等待到 09:05，再跑 09:05
-    - cron: "58 0  * * 1-5"
+    - cron: "50 0  * * 1-5"
 
 jobs:
   run-stock-bot:
