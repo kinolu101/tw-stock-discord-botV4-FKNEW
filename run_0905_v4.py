@@ -298,14 +298,14 @@ def run() -> None:
         if ma5 is None or ma10 is None or ma20 is None:
         continue
 
-       first_k_break_ma = (
+        first_k_break_ma = (
             first_close > ma5 and
             first_close > ma10 and
             first_close > ma20
         )
 
-        if not first_k_break_ma:
-            continue
+         if not first_k_break_ma:
+             continue
 
         above_60ma = ma60 is not None and latest > ma60
         status_60 = "上方 ✅" if above_60ma else "下方 ⚠️"
