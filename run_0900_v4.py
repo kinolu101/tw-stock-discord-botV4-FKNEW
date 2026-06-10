@@ -212,10 +212,10 @@ def run() -> None:
 
     if taiex_change_rate is not None and taiex_change_rate < -1.5:
         msg = f"【09:00 候選股】大盤目前 {taiex_change_rate:.2f}%，大盤過弱，今日暫不推薦做多候選。"
-    print(msg)
-    save_candidates([])
-    discord_send(msg)
-    return
+        print(msg)
+        save_candidates([])
+        discord_send(msg)
+        return
 
     contracts = get_stock_contracts(api)
     print(f"=== 09:00 V4 主流題材候選股開始掃描，共 {len(contracts)} 檔 ===")
