@@ -296,7 +296,7 @@ def run() -> None:
         ma5, ma10, ma20, ma60 = ma["ma5"], ma["ma10"], ma["ma20"], ma["ma60"]
 
         if ma5 is None or ma10 is None or ma20 is None:
-        continue
+            continue
 
         first_k_break_ma = (
             first_close > ma5 and
