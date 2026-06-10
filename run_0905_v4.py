@@ -285,15 +285,26 @@ def run() -> None:
         if first_close <= first_open:
             continue
 
+        if first_close <= open_price:
+            continue
+
         ma = get_recent_5m_ma(ticks_df)
         if ma is None:
             continue
 
-        latest = ma["latest_close"]
+        latest = first_close
         ma5, ma10, ma20, ma60 = ma["ma5"], ma["ma10"], ma["ma20"], ma["ma60"]
+
         if ma5 is None or ma10 is None or ma20 is None:
-            continue
-        if not (latest > ma5 and latest > ma10 and latest > ma20):
+        continue
+
+       first_k_break_ma = (
+            first_close > ma5 and
+            first_close > ma10 and
+            first_close > ma20
+        )
+
+        if not first_k_break_ma:
             continue
 
         above_60ma = ma60 is not None and latest > ma60
