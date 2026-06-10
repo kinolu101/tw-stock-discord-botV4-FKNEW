@@ -304,8 +304,8 @@ def run() -> None:
             first_close > ma20
         )
 
-         if not first_k_break_ma:
-             continue
+        if not first_k_break_ma:
+            continue
 
         above_60ma = ma60 is not None and latest > ma60
         status_60 = "上方 ✅" if above_60ma else "下方 ⚠️"
