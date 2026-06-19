@@ -1,11 +1,14 @@
 """
-09:00 台股開盤候選股掃描器 V4 Cloud
+09:00 Mr.Price 開盤策略候選股 V4
 
-V4 重點：
-- 移除 Google Sheets / service_account.json
-- 使用 Shioaji 掃描 09:00 候選股
-- 結果寫入 candidates_0900.json，供 09:05 使用
-- 可選擇發送 09:00 候選摘要到 Discord
+策略重點：
+- 先用高周轉/高成交值與開盤漲幅建立觀察池
+- 排除 ETF / KY / 不可當沖
+- 避免一開盤漲太高，預設漲幅 1%～6%
+- 結果寫入 candidates_0900.json，供 09:05 / 09:10 使用
+
+注意：影片中的完整進場條件重點在「量能黃金交叉 + 多頭排列 + 股價站均價線 + 第二根 5 分 K 突破第一根爆量 K 高點」。
+09:00 這支只先做觀察池，真正進場訊號放在 run_0910_v4.py。
 """
 
 import json
@@ -24,63 +27,19 @@ OUTPUT_FILE = os.getenv("CANDIDATES_FILE", "candidates_0900.json")
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "")
 
 MIN_CHANGE_RATE = float(os.getenv("MIN_CHANGE_RATE", "1.0"))
-MAX_CHANGE_RATE = float(os.getenv("MAX_CHANGE_RATE", "9.0"))
-MIN_VOLUME = float(os.getenv("MIN_VOLUME", "3000"))
-MIN_TURNOVER_TWD = float(os.getenv("MIN_TURNOVER_TWD", "300000000"))
+MAX_CHANGE_RATE = float(os.getenv("MAX_CHANGE_RATE", "6.0"))
+MIN_VOLUME = float(os.getenv("MIN_VOLUME", "1000"))
+MIN_TURNOVER_TWD = float(os.getenv("MIN_TURNOVER_TWD", "80000000"))
+TOP_PRINT_N = int(os.getenv("TOP_PRINT_N", "20"))
 
 EXCLUDE_KY = True
 EXCLUDE_ETF = True
-EXCLUDE_FINANCIAL = True
-THEME_ONLY = True
-TOP_PRINT_N = int(os.getenv("TOP_PRINT_N", "20"))
+EXCLUDE_FINANCIAL = os.getenv("EXCLUDE_FINANCIAL", "false").lower() in {"1", "true", "yes"}
 
-# 休市日可用 GitHub Secret / Variable 設定，例如：2026-01-01,2026-02-16
 TWSE_HOLIDAYS = {
     d.strip()
     for d in os.getenv("TWSE_HOLIDAYS", "").split(",")
     if d.strip()
-}
-
-THEME_STOCKS: Dict[str, str] = {
-    "3231": "AI伺服器",
-    "2382": "AI伺服器 / 雲端",
-    "6669": "AI伺服器 / 雲端資料中心",
-    "2356": "AI伺服器 / 代工補漲",
-    "2324": "AI伺服器 / 代工補漲",
-    "2317": "AI伺服器 / 電子權值",
-    "2376": "AI伺服器 / GPU / 主機板",
-    "2377": "AI伺服器 / 主機板",
-    "2388": "AI伺服器 / 電源",
-    "3706": "AI伺服器 / 工業電腦",
-
-    "2308": "電源 / AI伺服器",
-    "3017": "AI散熱",
-    "3324": "AI散熱",
-    "3653": "AI散熱 / 機構件",
-    "3483": "AI散熱",
-    "2421": "風扇 / 散熱",
-
-    "3661": "ASIC / AI晶片",
-    "3443": "ASIC / AI晶片",
-    "3035": "ASIC / IC設計",
-    "2454": "IC設計 / AI晶片",
-    "2330": "半導體權值",
-    "2303": "半導體權值",
-    "2363": "記憶體 / 半導體",
-    "3444": "記憶體 / 半導體",
-    "8299": "半導體設備 / 先進封裝",
-    "3167": "半導體設備",
-    "3583": "半導體設備",
-
-    "2383": "高速材料 / CCL",
-    "3037": "ABF載板 / PCB",
-    "8046": "PCB / 載板",
-    "3189": "PCB / 載板",
-    "2368": "PCB / HDI",
-    "6274": "PCB / 設備",
-    "2313": "PCB / 連接器",
-    "3533": "連接器 / 高速傳輸",
-    "6412": "高速傳輸 / 訊號完整性",
 }
 
 
@@ -136,8 +95,6 @@ def is_common_stock(contract: Any) -> bool:
         return False
     if EXCLUDE_FINANCIAL and (code.startswith("28") or "金" in name or "銀" in name or "保" in name):
         return False
-    if THEME_ONLY and code not in THEME_STOCKS:
-        return False
     return True
 
 
@@ -150,7 +107,7 @@ def is_day_tradeable(contract: Any) -> bool:
 
 
 def get_stock_contracts(api: sj.Shioaji) -> List[Any]:
-    contracts = []
+    contracts: List[Any] = []
     for exchange in ["TSE", "OTC"]:
         group = getattr(api.Contracts.Stocks, exchange, None)
         if group is None:
@@ -161,43 +118,52 @@ def get_stock_contracts(api: sj.Shioaji) -> List[Any]:
     return contracts
 
 
-def get_taiex_change_rate(api: sj.Shioaji) -> Optional[float]:
-    try:
-        idx = api.Contracts.Indexs.TSE["001"]
-        snap = api.snapshots([idx])[0]
-        return float(snap.change_rate)
-    except Exception as exc:
-        print(f"取得大盤漲跌幅失敗：{exc}")
-        return None
-
-
 def snapshot_batches(api: sj.Shioaji, contracts: List[Any], batch_size: int = 400):
     for i in range(0, len(contracts), batch_size):
         yield api.snapshots(contracts[i:i + batch_size])
 
 
+def calc_turnover_twd(close_price: float, total_volume: float) -> float:
+    # 台股 total_volume 通常是張，1 張 = 1000 股
+    return close_price * total_volume * 1000
+
+
 def calc_turnover_100m(close_price: float, total_volume: float) -> float:
-    return close_price * total_volume * 1000 / 100000000
+    return calc_turnover_twd(close_price, total_volume) / 100000000
 
 
-def score_candidate(change_rate: float, volume: float, turnover_100m: float, theme: str) -> int:
+def score_candidate(change_rate: float, volume: float, turnover_100m: float, close_price: float, open_price: float) -> int:
     score = 0
-    score += min(35, int(change_rate * 5))
+    score += min(30, int(change_rate * 5))
     score += min(30, int(volume / 3000 * 8))
-    score += min(25, int(turnover_100m / 3 * 12))
-    if any(k in theme for k in ["AI", "ASIC", "散熱", "高速材料", "ABF"]):
+    score += min(30, int(turnover_100m / 3 * 10))
+    if close_price > open_price:
         score += 10
     return min(score, 100)
 
 
 def save_candidates(rows: List[Dict[str, Any]]) -> None:
     payload = {
+        "strategy": "MrPrice_opening_watchlist_v4",
         "generated_at": now_tw().strftime("%Y-%m-%d %H:%M:%S"),
         "count": len(rows),
         "candidates": rows,
     }
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+def format_discord(rows: List[Dict[str, Any]]) -> str:
+    if not rows:
+        return "【09:00 Mr.Price開盤觀察池】共 0 檔"
+
+    lines = [f"【09:00 Mr.Price開盤觀察池】共 {len(rows)} 檔"]
+    for i, r in enumerate(rows[:TOP_PRINT_N], 1):
+        lines.append(
+            f"{i}. {r['股票代號']} {r['股票名稱']}｜漲幅 {r['漲幅']}%｜量 {int(r['成交量'])}｜成交值 {r['成交值(億)']}億｜強度 {r['強度分數']}"
+        )
+    lines.append("\n後續重點：09:05 確認第一根5分K量能，09:10 看第二根是否突破第一根爆量K高點。")
+    return "\n".join(lines)
 
 
 def run() -> None:
@@ -208,17 +174,8 @@ def run() -> None:
         return
 
     api = connect_shioaji()
-    taiex_change_rate = get_taiex_change_rate(api)
-
-    if taiex_change_rate is not None and taiex_change_rate < -1.5:
-        msg = f"【09:00 候選股】大盤目前 {taiex_change_rate:.2f}%，大盤過弱，今日暫不推薦做多候選。"
-        print(msg)
-        save_candidates([])
-        discord_send(msg)
-        return
-
     contracts = get_stock_contracts(api)
-    print(f"=== 09:00 V4 主流題材候選股開始掃描，共 {len(contracts)} 檔 ===")
+    print(f"=== 09:00 Mr.Price 開盤觀察池掃描，共 {len(contracts)} 檔 ===")
 
     rows: List[Dict[str, Any]] = []
     updated_at = now_tw().strftime("%Y-%m-%d %H:%M:%S")
@@ -235,13 +192,13 @@ def run() -> None:
 
             if not (MIN_CHANGE_RATE <= change_rate <= MAX_CHANGE_RATE):
                 continue
-            if total_volume <= MIN_VOLUME:
+            if total_volume < MIN_VOLUME:
                 continue
             if close_price <= open_price:
                 continue
 
-            turnover_100m = calc_turnover_100m(close_price, total_volume)
-            if turnover_100m * 100000000 < MIN_TURNOVER_TWD:
+            turnover_twd = calc_turnover_twd(close_price, total_volume)
+            if turnover_twd < MIN_TURNOVER_TWD:
                 continue
 
             try:
@@ -249,17 +206,14 @@ def run() -> None:
             except Exception:
                 continue
 
-            name = getattr(contract, "name", "")
-            theme = THEME_STOCKS.get(s.code, "主流題材")
-            score = score_candidate(change_rate, total_volume, turnover_100m, theme)
-
+            score = score_candidate(change_rate, total_volume, turnover_twd / 100000000, close_price, open_price)
             rows.append({
                 "股票代號": s.code,
-                "股票名稱": name,
-                "題材": theme,
-                "漲幅": change_rate,
+                "股票名稱": getattr(contract, "name", ""),
+                "題材": "高周轉率/開盤強勢",
+                "漲幅": round(change_rate, 2),
                 "成交量": total_volume,
-                "成交值(億)": round(turnover_100m, 2),
+                "成交值(億)": round(turnover_twd / 100000000, 2),
                 "開盤價": open_price,
                 "目前價": close_price,
                 "是否可當沖": "是",
@@ -267,23 +221,15 @@ def run() -> None:
                 "更新時間": updated_at,
             })
 
-    rows.sort(key=lambda r: (int(r["強度分數"]), float(r["成交值(億)"]), float(r["成交量"])), reverse=True)
+    rows.sort(key=lambda r: (float(r["漲幅"]), float(r["成交值(億)"]), float(r["成交量"])), reverse=True)
+    rows = rows[:TOP_PRINT_N]
     save_candidates(rows)
 
-    for r in rows[:TOP_PRINT_N]:
-        print(
-            f"候選 {r['股票代號']} {r['股票名稱']} 題材:{r['題材']} "
-            f"漲幅:{r['漲幅']} 成交量:{r['成交量']} 成交值:{r['成交值(億)']}億 強度:{r['強度分數']}"
-        )
+    for r in rows:
+        print(f"{r['股票代號']} {r['股票名稱']} 漲幅:{r['漲幅']} 量:{r['成交量']} 成交值:{r['成交值(億)']}億 強度:{r['強度分數']}")
 
-    lines = [f"【09:00 候選股】共 {len(rows)} 檔"]
-    for i, r in enumerate(rows[:5], 1):
-        lines.append(
-            f"{i}. {r['股票代號']} {r['股票名稱']}｜{r['題材']}｜"
-            f"漲幅 {r['漲幅']}%｜量 {int(r['成交量'])}｜強度 {r['強度分數']}"
-        )
-    discord_send("\n".join(lines))
-    print(f"=== 09:00 V4 完成，共 {len(rows)} 筆 ===")
+    discord_send(format_discord(rows))
+    print(f"=== 09:00 Mr.Price 開盤觀察池完成，共 {len(rows)} 檔 ===")
 
 
 if __name__ == "__main__":

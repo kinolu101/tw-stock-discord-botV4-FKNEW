@@ -1,11 +1,11 @@
-"""
-09:05 台股突破股掃描器 V4 Cloud
 
-V4 重點：
-- 從 candidates_0900.json 讀取 09:00 候選股
-- 不使用 Google Sheets
-- 篩選 09:05 突破股前 TOP_N
-- 發送 Discord 通知
+# -*- coding: utf-8 -*-
+"""
+Mr.Price 開盤策略共用邏輯說明：
+- 量能 5MA / 60MA 黃金交叉：用 5 分 K 成交量均線判斷
+- 多頭排列：優先用 10MA > 20MA > 30MA > 60MA；資料不足時用 5MA > 10MA > 20MA 簡化
+- 均價線：用當日 VWAP 近似
+- 爆量 K 高點：第一根 5 分 K 的 high
 """
 
 import json
@@ -17,26 +17,42 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
+import time
 import shioaji as sj
 from dotenv import load_dotenv
 
 TZ = ZoneInfo("Asia/Taipei")
 
 INPUT_FILE = os.getenv("CANDIDATES_FILE", "candidates_0900.json")
-OUTPUT_FILE = os.getenv("BREAKOUTS_FILE", "breakouts_0905.json")
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "")
 
 MIN_CHANGE_RATE = float(os.getenv("MIN_CHANGE_RATE", "1.0"))
-MAX_CHANGE_RATE = float(os.getenv("MAX_CHANGE_RATE", "9.0"))
-MIN_VOLUME = float(os.getenv("MIN_VOLUME", "3000"))
-MIN_TURNOVER_TWD = float(os.getenv("MIN_TURNOVER_TWD", "300000000"))
-TOP_N = int(os.getenv("TOP_N", "2"))
+MAX_CHANGE_RATE = float(os.getenv("MAX_CHANGE_RATE", "6.0"))
+MIN_VOLUME = float(os.getenv("MIN_VOLUME", "1000"))
+MIN_TURNOVER_TWD = float(os.getenv("MIN_TURNOVER_TWD", "80000000"))
+TOP_N = int(os.getenv("TOP_N", "3"))
+TOP_PRINT_N = int(os.getenv("TOP_PRINT_N", "20"))
+MAX_KBAR_CHECK = int(os.getenv("MAX_KBAR_CHECK", "40"))
+ALLOW_NEAR_BULL = os.getenv("ALLOW_NEAR_BULL", "true").lower() in {"1", "true", "yes"}
+REQUIRE_CLOSE_BREAK_FIRST_HIGH = os.getenv("REQUIRE_CLOSE_BREAK_FIRST_HIGH", "true").lower() in {"1", "true", "yes"}
+
+# 09:05 後盤中突破監看設定
+POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "10"))
+MONITOR_MINUTES = int(os.getenv("MONITOR_MINUTES", "5"))
+BREAKOUT_TICKS = int(os.getenv("BREAKOUT_TICKS", "2"))
+MAX_FIRST_UPPER_WICK_RATIO = float(os.getenv("MAX_FIRST_UPPER_WICK_RATIO", "0.35"))
+MIN_VOLUME_SPEED_RATIO = float(os.getenv("MIN_VOLUME_SPEED_RATIO", "1.20"))
+MIN_FIRST_VOLUME_MULTIPLIER = float(os.getenv("MIN_FIRST_VOLUME_MULTIPLIER", "1.50"))
 
 TWSE_HOLIDAYS = {
     d.strip()
     for d in os.getenv("TWSE_HOLIDAYS", "").split(",")
     if d.strip()
 }
+
+EXCLUDE_KY = True
+EXCLUDE_ETF = True
+EXCLUDE_FINANCIAL = os.getenv("EXCLUDE_FINANCIAL", "false").lower() in {"1", "true", "yes"}
 
 
 def now_tw() -> datetime:
@@ -70,10 +86,8 @@ def connect_shioaji() -> sj.Shioaji:
     api_key = os.getenv("SHIOAJI_API_KEY")
     secret_key = os.getenv("SHIOAJI_SECRET_KEY")
     simulation = str_to_bool(os.getenv("SHIOAJI_SIMULATION"), default=False)
-
     if not api_key or not secret_key:
         raise RuntimeError("缺少 SHIOAJI_API_KEY 或 SHIOAJI_SECRET_KEY")
-
     api = sj.Shioaji(simulation=simulation)
     api.login(api_key=api_key, secret_key=secret_key)
     print(f"Shioaji simulation={simulation}")
@@ -88,13 +102,219 @@ def is_day_tradeable(contract: Any) -> bool:
     return "yes" in text or text in {"true", "1", "daytrade.yes"}
 
 
+def is_common_stock(contract: Any) -> bool:
+    code = getattr(contract, "code", "")
+    name = getattr(contract, "name", "")
+    if not code.isdigit() or len(code) != 4:
+        return False
+    if EXCLUDE_KY and "KY" in name.upper():
+        return False
+    if EXCLUDE_ETF and ("ETF" in name.upper() or code.startswith("00")):
+        return False
+    if EXCLUDE_FINANCIAL and (code.startswith("28") or "金" in name or "銀" in name or "保" in name):
+        return False
+    return True
+
+
+def get_stock_contracts(api: sj.Shioaji) -> List[Any]:
+    contracts: List[Any] = []
+    for exchange in ["TSE", "OTC"]:
+        group = getattr(api.Contracts.Stocks, exchange, None)
+        if group is None:
+            continue
+        for contract in group:
+            if is_common_stock(contract) and is_day_tradeable(contract):
+                contracts.append(contract)
+    return contracts
+
+
+def snapshot_batches(api: sj.Shioaji, contracts: List[Any], batch_size: int = 400):
+    for i in range(0, len(contracts), batch_size):
+        yield api.snapshots(contracts[i:i + batch_size])
+
+
+def calc_turnover_twd(close_price: float, total_volume: float) -> float:
+    return close_price * total_volume * 1000
+
+
 def calc_turnover_100m(close_price: float, total_volume: float) -> float:
-    return close_price * total_volume * 1000 / 100000000
+    return calc_turnover_twd(close_price, total_volume) / 100000000
+
+
+def load_candidates() -> List[Dict[str, Any]]:
+    if not os.path.exists(INPUT_FILE):
+        return []
+    with open(INPUT_FILE, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    return payload.get("candidates", [])
+
+
+def build_snapshot_candidates(api: sj.Shioaji, limit: int = MAX_KBAR_CHECK) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    contracts = get_stock_contracts(api)
+    for snaps in snapshot_batches(api, contracts):
+        for s in snaps:
+            try:
+                change_rate = float(s.change_rate)
+                total_volume = float(s.total_volume)
+                open_price = float(s.open)
+                close_price = float(s.close)
+            except Exception:
+                continue
+            if not (MIN_CHANGE_RATE <= change_rate <= MAX_CHANGE_RATE):
+                continue
+            if total_volume < MIN_VOLUME:
+                continue
+            if close_price <= open_price:
+                continue
+            turnover_twd = calc_turnover_twd(close_price, total_volume)
+            if turnover_twd < MIN_TURNOVER_TWD:
+                continue
+            try:
+                contract = api.Contracts.Stocks[s.code]
+            except Exception:
+                continue
+            rows.append({
+                "股票代號": s.code,
+                "股票名稱": getattr(contract, "name", ""),
+                "題材": "高周轉率/開盤強勢",
+                "漲幅": round(change_rate, 2),
+                "成交量": total_volume,
+                "成交值(億)": round(turnover_twd / 100000000, 2),
+                "開盤價": open_price,
+                "目前價": close_price,
+                "是否可當沖": "是",
+            })
+    rows.sort(key=lambda r: (float(r["漲幅"]), float(r["成交值(億)"]), float(r["成交量"])), reverse=True)
+    return rows[:limit]
+
+
+def get_contract(api: sj.Shioaji, code: str) -> Optional[Any]:
+    try:
+        return api.Contracts.Stocks[code]
+    except Exception:
+        return None
+
+
+def kbars_to_df(kbars: Any) -> Optional[pd.DataFrame]:
+    try:
+        ts = getattr(kbars, "ts")
+        df = pd.DataFrame({
+            "ts": pd.to_datetime(ts),
+            "open": getattr(kbars, "Open"),
+            "high": getattr(kbars, "High"),
+            "low": getattr(kbars, "Low"),
+            "close": getattr(kbars, "Close"),
+            "volume": getattr(kbars, "Volume"),
+        })
+        amount = getattr(kbars, "Amount", None)
+        if amount is not None:
+            df["amount"] = amount
+        else:
+            df["amount"] = df["close"] * df["volume"]
+    except Exception as exc:
+        print(f"kbars 轉 DataFrame 失敗：{exc}")
+        return None
+    if df.empty:
+        return None
+    if df["ts"].dt.tz is not None:
+        df["ts"] = df["ts"].dt.tz_convert("Asia/Taipei").dt.tz_localize(None)
+    return df.sort_values("ts")
+
+
+def get_5m_bars(api: sj.Shioaji, contract: Any, days_back: int = 14) -> Optional[pd.DataFrame]:
+    end_date = now_tw().date()
+    start_date = end_date - timedelta(days=days_back)
+    try:
+        kbars = api.kbars(contract=contract, start=start_date.strftime("%Y-%m-%d"), end=end_date.strftime("%Y-%m-%d"))
+    except Exception as exc:
+        print(f"取得 kbars 失敗 {getattr(contract, 'code', '')}: {exc}")
+        return None
+    raw = kbars_to_df(kbars)
+    if raw is None or raw.empty:
+        return None
+    raw = raw.set_index("ts")
+    agg = {
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+        "volume": "sum",
+        "amount": "sum",
+    }
+    bars = raw.resample("5min", label="left", closed="left").agg(agg).dropna()
+    bars = bars[bars["volume"] > 0]
+    if bars.empty:
+        return None
+    return bars
+
+
+def get_bar_at(bars: pd.DataFrame, hour: int, minute: int) -> Optional[pd.Series]:
+    idx = datetime.combine(now_tw().date(), datetime.min.time()).replace(hour=hour, minute=minute)
+    try:
+        row = bars.loc[idx]
+        if isinstance(row, pd.DataFrame):
+            row = row.iloc[-1]
+        return row
+    except KeyError:
+        return None
+
+
+def volume_golden_cross(bars: pd.DataFrame, current_time: datetime) -> bool:
+    if len(bars) < 62:
+        return False
+    vol = bars["volume"].astype(float)
+    vma5 = vol.rolling(5).mean()
+    vma60 = vol.rolling(60).mean()
+    try:
+        pos = bars.index.get_loc(current_time)
+        if isinstance(pos, slice):
+            pos = pos.stop - 1
+        if isinstance(pos, (list, tuple)):
+            pos = pos[-1]
+    except Exception:
+        return False
+
+    def crossed_at(i: int) -> bool:
+        if i <= 0 or pd.isna(vma5.iloc[i]) or pd.isna(vma60.iloc[i]) or pd.isna(vma5.iloc[i - 1]) or pd.isna(vma60.iloc[i - 1]):
+            return False
+        return vma5.iloc[i] > vma60.iloc[i] and vma5.iloc[i - 1] <= vma60.iloc[i - 1]
+
+    # 影片提到：昨天最後一盤或今天 9:00 其中一根出現量能黃金交叉都可關注
+    return crossed_at(pos) or crossed_at(pos - 1)
+
+
+def price_trend_state(bars: pd.DataFrame, current_time: datetime) -> Tuple[bool, str, Dict[str, Optional[float]]]:
+    close = bars["close"].astype(float)
+    ma: Dict[str, Optional[float]] = {}
+    for n in [5, 10, 20, 30, 60]:
+        ma[f"ma{n}"] = float(close.rolling(n).mean().loc[current_time]) if len(close.loc[:current_time]) >= n else None
+
+    ma5, ma10, ma20, ma30, ma60 = ma["ma5"], ma["ma10"], ma["ma20"], ma["ma30"], ma["ma60"]
+    if ma10 is not None and ma20 is not None and ma30 is not None and ma60 is not None and ma10 > ma20 > ma30 > ma60:
+        return True, "多頭排列10>20>30>60 ✅", ma
+    if ALLOW_NEAR_BULL and ma5 is not None and ma10 is not None and ma20 is not None and ma5 > ma10 > ma20:
+        return True, "短線多頭5>10>20 ✅", ma
+    return False, "趨勢未多頭 ⚠️", ma
+
+
+def calc_vwap_today(bars: pd.DataFrame, until_time: datetime) -> Optional[float]:
+    today_start = datetime.combine(now_tw().date(), datetime.min.time()).replace(hour=9, minute=0)
+    day = bars[(bars.index >= today_start) & (bars.index <= until_time)]
+    if day.empty or day["volume"].sum() <= 0:
+        return None
+    return float(day["amount"].sum() / day["volume"].sum())
+
 
 
 def get_ticks_df(api: sj.Shioaji, contract: Any) -> Optional[pd.DataFrame]:
+    """取得當日逐筆成交，供盤中突破、VWAP 與量速判斷。"""
     today = now_tw().date()
-    ticks = api.ticks(contract=contract, date=today.strftime("%Y-%m-%d"))
+    try:
+        ticks = api.ticks(contract=contract, date=today.strftime("%Y-%m-%d"))
+    except Exception as exc:
+        print(f"取得 ticks 失敗 {getattr(contract, 'code', '')}: {exc}")
+        return None
     if ticks is None or len(ticks.ts) == 0:
         return None
     df = pd.DataFrame({
@@ -107,29 +327,63 @@ def get_ticks_df(api: sj.Shioaji, contract: Any) -> Optional[pd.DataFrame]:
     return df.sort_values("ts")
 
 
-def get_first_5m_k(df: pd.DataFrame) -> Optional[Tuple[float, float, float]]:
+def first_5m_from_ticks(df: pd.DataFrame) -> Optional[Dict[str, float]]:
     today = now_tw().date()
     start = datetime.combine(today, datetime.min.time()).replace(hour=9, minute=0)
     end = start + timedelta(minutes=5)
-    kdf = df[(df["ts"] >= start) & (df["ts"] < end)]
-    if kdf.empty:
-        return None
-    return float(kdf.iloc[0]["price"]), float(kdf.iloc[-1]["price"]), float(kdf["volume"].sum())
-
-
-def get_recent_5m_ma(df: pd.DataFrame) -> Optional[Dict[str, Optional[float]]]:
-    if df.empty:
-        return None
-    k = df.set_index("ts")["price"].sort_index().resample("5min", label="right", closed="right").ohlc().dropna()
+    k = df[(df["ts"] >= start) & (df["ts"] < end)]
     if k.empty:
         return None
-    close = k["close"]
-    latest_close = float(close.iloc[-1])
-    result: Dict[str, Optional[float]] = {"latest_close": latest_close}
-    for n in [5, 10, 20, 60]:
-        result[f"ma{n}"] = float(close.rolling(n).mean().iloc[-1]) if len(close) >= n else None
-    return result
+    return {
+        "open": float(k.iloc[0]["price"]),
+        "high": float(k["price"].max()),
+        "low": float(k["price"].min()),
+        "close": float(k.iloc[-1]["price"]),
+        "volume": float(k["volume"].sum()),
+    }
 
+
+def intraday_vwap_from_ticks(df: pd.DataFrame) -> Optional[float]:
+    today = now_tw().date()
+    start = datetime.combine(today, datetime.min.time()).replace(hour=9, minute=0)
+    day = df[df["ts"] >= start]
+    if day.empty:
+        return None
+    volume = day["volume"].astype(float)
+    if volume.sum() <= 0:
+        return None
+    return float((day["price"].astype(float) * volume).sum() / volume.sum())
+
+
+def recent_volume_speed(df: pd.DataFrame) -> Tuple[float, float, float]:
+    """回傳最近完整/進行中 1 分鐘量、前 1 分鐘量、兩者比率。"""
+    if df.empty:
+        return 0.0, 0.0, 0.0
+    now_naive = now_tw().replace(tzinfo=None)
+    current_start = now_naive.replace(second=0, microsecond=0)
+    previous_start = current_start - timedelta(minutes=1)
+    current = df[(df["ts"] >= current_start) & (df["ts"] <= now_naive)]
+    previous = df[(df["ts"] >= previous_start) & (df["ts"] < current_start)]
+    current_vol = float(current["volume"].sum()) if not current.empty else 0.0
+    previous_vol = float(previous["volume"].sum()) if not previous.empty else 0.0
+    ratio = current_vol / previous_vol if previous_vol > 0 else (999.0 if current_vol > 0 else 0.0)
+    return current_vol, previous_vol, ratio
+
+
+def previous_5bar_volume_average(bars: pd.DataFrame, first_time: datetime) -> Optional[float]:
+    earlier = bars[bars.index < first_time]["volume"].astype(float).tail(5)
+    if len(earlier) < 3:
+        return None
+    return float(earlier.mean())
+
+
+def first_bar_quality(first: Dict[str, float]) -> Tuple[bool, float]:
+    full_range = first["high"] - first["low"]
+    if full_range <= 0:
+        return False, 1.0
+    upper_wick = first["high"] - max(first["open"], first["close"])
+    ratio = upper_wick / full_range
+    return ratio <= MAX_FIRST_UPPER_WICK_RATIO, ratio
 
 def tick_size(price: float) -> float:
     if price < 10:
@@ -155,59 +409,49 @@ def round_down_tick(price: float) -> float:
     return round(math.floor(price / t) * t, 2)
 
 
-def calc_trade_prices(open_price: float, close_price: float) -> Tuple[float, float, float, float]:
-    entry = round_up_tick(max(open_price * 1.002, close_price))
-    stop = round_down_tick(min(open_price * 0.99, entry * 0.985))
+def calc_trade_prices(entry_base: float, first_low: float) -> Tuple[float, float, float, float]:
+    entry = round_up_tick(entry_base)
+    stop = round_down_tick(min(first_low, entry * 0.985))
     tp1 = round_down_tick(entry * 1.02)
     tp2 = round_down_tick(entry * 1.04)
     return entry, stop, tp1, tp2
 
 
-def score_stock(change_rate: float, total_volume: float, turnover_100m: float, first_k_volume: float, above_60ma: bool) -> int:
+def score_stock(change_rate: float, total_volume: float, turnover_100m: float, volume_cross: bool, trend_ok: bool, above_vwap: bool, breakout: bool) -> int:
     score = 0
-    score += min(30, int(change_rate * 5))
-    score += min(25, int(total_volume / 3000 * 7))
-    score += min(25, int(turnover_100m / 3 * 10))
-    score += min(10, int(first_k_volume / 1000 * 3))
-    score += 10 if above_60ma else 0
+    score += min(20, int(change_rate * 4))
+    score += min(20, int(total_volume / 3000 * 6))
+    score += min(20, int(turnover_100m / 3 * 8))
+    score += 15 if volume_cross else 0
+    score += 15 if trend_ok else 0
+    score += 10 if above_vwap else 0
+    score += 20 if breakout else 0
     return min(score, 100)
 
 
-def load_candidates() -> List[Dict[str, Any]]:
-    if not os.path.exists(INPUT_FILE):
-        return []
-    with open(INPUT_FILE, "r", encoding="utf-8") as f:
-        payload = json.load(f)
-    return payload.get("candidates", [])
+OUTPUT_FILE = os.getenv("BREAKOUTS_FILE", "breakouts_0905.json")
 
 
-def save_breakouts(rows: List[Dict[str, Any]]) -> None:
+def save_results(rows: List[Dict[str, Any]]) -> None:
     payload = {
+        "strategy": "0905_intraday_breakout_v4",
         "generated_at": now_tw().strftime("%Y-%m-%d %H:%M:%S"),
         "count": len(rows),
-        "breakouts": rows,
+        "results": rows,
     }
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
 
-def format_discord(results: List[Dict[str, Any]]) -> str:
-    if not results:
-        return "【09:05 突破股】今日無符合條件標的。"
-
-    lines = ["【09:05 突破股 TOP 2】"]
-    for i, r in enumerate(results, 1):
-        lines.extend([
-            "",
-            f"{i}. {r['股票代號']} {r['股票名稱']}｜{r['題材']}",
-            f"漲幅：{r['漲幅']}%｜成交量：{int(r['成交量'])}｜成交值：{r['成交值(億)']}億",
-            f"第一根5分K：{r['第一根5分K']}｜突破開盤價：是",
-            f"5MA：{r['5MA']}｜10MA：{r['10MA']}｜20MA：{r['20MA']}",
-            f"60MA：{r['60MA']}｜狀態：{r['60MA狀態']}",
-            f"進場：{r['進場價']}｜停損：{r['停損價']}｜停利1：{r['停利1']}｜停利2：{r['停利2']}",
-            f"強度分數：{r['強度分數']}",
-        ])
-    return "\n".join(lines)
+def format_breakout_alert(r: Dict[str, Any]) -> str:
+    return "\n".join([
+        "【09:05後 即時突破提醒】",
+        f"{r['股票代號']} {r['股票名稱']}｜漲幅 {r['漲幅']}%｜成交值 {r['成交值(億)']}億",
+        f"現價 {r['目前價']}｜第一根高點 {r['第一根高點']}｜突破門檻 {r['突破門檻']}",
+        f"VWAP {r['VWAP']}｜量速 {r['量速比']} 倍｜第一根上影比例 {r['第一根上影比例']}",
+        f"參考進場 {r['參考進場']}｜防守價 {r['防守價']}｜目標1 {r['目標1']}｜目標2 {r['目標2']}",
+        "提醒：這是條件警示，不代表保證上漲；下單前仍需確認委買賣與滑價。",
+    ])
 
 
 def run() -> None:
@@ -215,144 +459,156 @@ def run() -> None:
         print("今日台股未開盤，09:05 不執行選股。")
         return
 
+    api = connect_shioaji()
     candidates = load_candidates()
     if not candidates:
-        msg = "【09:05 突破股】找不到 09:00 候選名單或候選為 0。"
+        print("找不到 candidates_0900.json，改用即時 snapshot 重建觀察池。")
+        candidates = build_snapshot_candidates(api, MAX_KBAR_CHECK)
+    else:
+        candidates = candidates[:MAX_KBAR_CHECK]
+
+    if not candidates:
+        msg = "【09:05後 即時突破提醒】今日沒有可監看的 09:00 候選股。"
         print(msg)
-        save_breakouts([])
+        save_results([])
         discord_send(msg)
         return
 
-    api = connect_shioaji()
+    first_time = datetime.combine(now_tw().date(), datetime.min.time()).replace(hour=9, minute=0)
+    monitor_end = now_tw() + timedelta(minutes=MONITOR_MINUTES)
+    alerted_codes: set[str] = set()
+    all_results: List[Dict[str, Any]] = []
 
-    codes = [str(r["股票代號"]).strip() for r in candidates]
-    contracts = []
-    candidate_map = {str(r["股票代號"]).strip(): r for r in candidates}
+    print(
+        f"=== 09:05後盤中突破監看開始，共 {len(candidates)} 檔；"
+        f"每 {POLL_INTERVAL_SECONDS} 秒掃描，約 {MONITOR_MINUTES} 分鐘 ==="
+    )
 
-    for code in codes:
-        try:
-            contracts.append(api.Contracts.Stocks[code])
-        except Exception:
-            continue
+    while now_tw() < monitor_end:
+        active = [r for r in candidates if str(r.get("股票代號", "")).strip() not in alerted_codes]
+        if not active:
+            break
 
-    snapshots = api.snapshots(contracts)
-    snap_map = {s.code: s for s in snapshots}
-
-    print(f"=== 09:05 V4 從候選名單篩選突破股，共 {len(candidates)} 檔 ===")
-
-    results: List[Dict[str, Any]] = []
-    updated_at = now_tw().strftime("%Y-%m-%d %H:%M:%S")
-
-    for contract in contracts:
-        code = contract.code
-        s = snap_map.get(code)
-        old = candidate_map.get(code, {})
-        if s is None:
-            continue
+        contracts: List[Any] = []
+        candidate_map: Dict[str, Dict[str, Any]] = {}
+        for old in active:
+            code = str(old.get("股票代號", "")).strip()
+            contract = get_contract(api, code)
+            if contract is not None and is_day_tradeable(contract):
+                contracts.append(contract)
+                candidate_map[code] = old
 
         try:
-            change_rate = float(s.change_rate)
-            total_volume = float(s.total_volume)
-            open_price = float(s.open)
-            close_price = float(s.close)
-            volume_0900 = float(old.get("成交量") or 0)
-        except Exception:
+            snapshots = api.snapshots(contracts) if contracts else []
+        except Exception as exc:
+            print(f"取得 snapshots 失敗：{exc}")
+            time.sleep(POLL_INTERVAL_SECONDS)
             continue
+        snap_map = {s.code: s for s in snapshots}
 
-        if not is_day_tradeable(contract):
-            continue
-        if not (MIN_CHANGE_RATE <= change_rate <= MAX_CHANGE_RATE):
-            continue
-        if total_volume <= MIN_VOLUME:
-            continue
-        if total_volume <= volume_0900:
-            continue
-        if close_price <= open_price:
-            continue
+        for contract in contracts:
+            code = contract.code
+            old = candidate_map.get(code, {})
+            snap = snap_map.get(code)
+            if snap is None:
+                continue
 
-        turnover_100m = calc_turnover_100m(close_price, total_volume)
-        if turnover_100m * 100000000 < MIN_TURNOVER_TWD:
-            continue
+            try:
+                current_price = float(snap.close)
+                change_rate = float(snap.change_rate)
+                total_volume = float(snap.total_volume)
+                turnover_100m = calc_turnover_100m(current_price, total_volume)
+            except Exception:
+                continue
 
-        ticks_df = get_ticks_df(api, contract)
-        if ticks_df is None:
-            continue
+            if not (MIN_CHANGE_RATE <= change_rate <= MAX_CHANGE_RATE):
+                continue
+            if total_volume < MIN_VOLUME:
+                continue
+            if turnover_100m * 100000000 < MIN_TURNOVER_TWD:
+                continue
 
-        first_k = get_first_5m_k(ticks_df)
-        if first_k is None:
-            continue
-        first_open, first_close, first_volume = first_k
-        if first_close <= first_open:
-            continue
+            ticks = get_ticks_df(api, contract)
+            if ticks is None:
+                continue
+            first = first_5m_from_ticks(ticks)
+            if first is None:
+                continue
 
-        if first_close <= open_price:
-            continue
+            # 第一根需紅 K、上影線不可過長
+            if first["close"] <= first["open"]:
+                continue
+            quality_ok, upper_wick_ratio = first_bar_quality(first)
+            if not quality_ok:
+                continue
 
-        ma = get_recent_5m_ma(ticks_df)
-        if ma is None:
-            continue
+            bars = get_5m_bars(api, contract)
+            if bars is None:
+                continue
 
-        latest = first_close
-        ma5, ma10, ma20, ma60 = ma["ma5"], ma["ma10"], ma["ma20"], ma["ma60"]
+            # 保留影片策略核心：量能黃金交叉、短多趨勢
+            volume_cross = volume_golden_cross(bars, first_time)
+            trend_ok, trend_text, _ = price_trend_state(bars, first_time)
+            if not volume_cross or not trend_ok:
+                continue
 
-        if ma5 is None or ma10 is None or ma20 is None:
-            continue
+            # 第一根需相對先前 5 根有放量
+            prev_avg = previous_5bar_volume_average(bars, first_time)
+            if prev_avg is not None and first["volume"] < prev_avg * MIN_FIRST_VOLUME_MULTIPLIER:
+                continue
 
-        first_k_break_ma = (
-            first_close > ma5 and
-            first_close > ma10 and
-            first_close > ma20
-        )
+            vwap = intraday_vwap_from_ticks(ticks)
+            if vwap is None or current_price <= vwap:
+                continue
 
-        if not first_k_break_ma:
-            continue
+            current_1m, previous_1m, speed_ratio = recent_volume_speed(ticks)
+            if previous_1m <= 0 or speed_ratio < MIN_VOLUME_SPEED_RATIO:
+                continue
 
-        above_60ma = ma60 is not None and latest > ma60
-        status_60 = "上方 ✅" if above_60ma else "下方 ⚠️"
-        score = score_stock(change_rate, total_volume, turnover_100m, first_volume, above_60ma)
-        entry, stop, tp1, tp2 = calc_trade_prices(open_price, close_price)
+            trigger = round_up_tick(first["high"] + tick_size(first["high"]) * BREAKOUT_TICKS)
+            if current_price < trigger:
+                continue
 
-        result = {
-            "股票代號": code,
-            "股票名稱": getattr(contract, "name", ""),
-            "題材": str(old.get("題材") or "主流題材"),
-            "漲幅": change_rate,
-            "成交量": total_volume,
-            "成交值(億)": round(turnover_100m, 2),
-            "開盤價": open_price,
-            "目前價": close_price,
-            "是否可當沖": "是",
-            "是否突破開盤價": "是",
-            "第一根5分K": "紅K ✅",
-            "5MA": round(ma5, 2),
-            "10MA": round(ma10, 2),
-            "20MA": round(ma20, 2),
-            "60MA": round(ma60, 2) if ma60 is not None else "資料不足",
-            "60MA狀態": status_60,
-            "進場價": entry,
-            "停損價": stop,
-            "停利1": tp1,
-            "停利2": tp2,
-            "強度分數": score,
-            "更新時間": updated_at,
-        }
-        results.append(result)
+            entry = round_up_tick(current_price)
+            stop = round_down_tick(max(first["high"] - tick_size(first["high"]) * 2, entry * 0.994))
+            tp1 = round_down_tick(entry * 1.01)
+            tp2 = round_down_tick(entry * 1.02)
 
-    results.sort(key=lambda r: (int(r["強度分數"]), float(r["成交值(億)"]), float(r["成交量"])), reverse=True)
-    top_results = results[:TOP_N]
-    save_breakouts(top_results)
+            result = {
+                "股票代號": code,
+                "股票名稱": getattr(contract, "name", old.get("股票名稱", "")),
+                "漲幅": round(change_rate, 2),
+                "成交量": total_volume,
+                "成交值(億)": round(turnover_100m, 2),
+                "目前價": round(current_price, 2),
+                "第一根高點": round(first["high"], 2),
+                "第一根低點": round(first["low"], 2),
+                "第一根收盤": round(first["close"], 2),
+                "第一根量": round(first["volume"], 0),
+                "第一根上影比例": f"{upper_wick_ratio:.0%}",
+                "突破門檻": trigger,
+                "VWAP": round(vwap, 2),
+                "目前1分鐘量": round(current_1m, 0),
+                "前1分鐘量": round(previous_1m, 0),
+                "量速比": round(speed_ratio, 2),
+                "趨勢狀態": trend_text,
+                "參考進場": entry,
+                "防守價": stop,
+                "目標1": tp1,
+                "目標2": tp2,
+                "更新時間": now_tw().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            alerted_codes.add(code)
+            all_results.append(result)
+            discord_send(format_breakout_alert(result))
+            print(f"已提醒：{code} {result['股票名稱']} 現價 {current_price} 突破門檻 {trigger}")
 
-    for r in top_results:
-        print(
-            f"{r['股票代號']} {r['股票名稱']} 題材:{r['題材']} 漲幅:{r['漲幅']} "
-            f"成交量:{r['成交量']} 成交值:{r['成交值(億)']}億 "
-            f"第一根:{r['第一根5分K']} 5MA:{r['5MA']} 10MA:{r['10MA']} 20MA:{r['20MA']} "
-            f"60MA:{r['60MA']} {r['60MA狀態']} 進場:{r['進場價']} 停損:{r['停損價']} "
-            f"停利:{r['停利1']}/{r['停利2']} 強度:{r['強度分數']}"
-        )
+        time.sleep(POLL_INTERVAL_SECONDS)
 
-    discord_send(format_discord(top_results))
-    print(f"=== 09:05 V4 完成，共 {len(top_results)} 檔 ===")
+    save_results(all_results)
+    if not all_results:
+        discord_send("【09:05後 即時突破提醒】監看期間沒有符合條件的標的。")
+    print(f"=== 09:05後盤中突破監看結束，共提醒 {len(all_results)} 檔 ===")
 
 
 if __name__ == "__main__":
