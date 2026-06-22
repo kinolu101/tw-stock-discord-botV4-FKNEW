@@ -13,10 +13,11 @@
 
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
+import pandas as pd
 import requests
 import shioaji as sj
 from dotenv import load_dotenv
@@ -42,6 +43,191 @@ TWSE_HOLIDAYS = {
     if d.strip()
 }
 
+
+
+SUPPORT_RESISTANCE_DAYS = int(os.getenv("SUPPORT_RESISTANCE_DAYS", "20"))
+SUPPORT_RESISTANCE_LOOKBACK_CALENDAR_DAYS = int(
+    os.getenv("SUPPORT_RESISTANCE_LOOKBACK_CALENDAR_DAYS", "45")
+)
+SUPPORT_RESISTANCE_ZONE_RATIO = float(
+    os.getenv("SUPPORT_RESISTANCE_ZONE_RATIO", "0.003")
+)
+
+
+def tick_size(price: float) -> float:
+    if price < 10:
+        return 0.01
+    if price < 50:
+        return 0.05
+    if price < 100:
+        return 0.1
+    if price < 500:
+        return 0.5
+    if price < 1000:
+        return 1.0
+    return 5.0
+
+
+def round_up_tick(price: float) -> float:
+    import math
+    step = tick_size(price)
+    return round(math.ceil(price / step - 1e-9) * step, 2)
+
+
+def round_down_tick(price: float) -> float:
+    import math
+    step = tick_size(price)
+    return round(math.floor(price / step + 1e-9) * step, 2)
+
+
+def _kbars_to_intraday_df(kbars: Any) -> Optional[pd.DataFrame]:
+    try:
+        df = pd.DataFrame({
+            "ts": pd.to_datetime(getattr(kbars, "ts")),
+            "open": getattr(kbars, "Open"),
+            "high": getattr(kbars, "High"),
+            "low": getattr(kbars, "Low"),
+            "close": getattr(kbars, "Close"),
+            "volume": getattr(kbars, "Volume"),
+        })
+    except Exception as exc:
+        print(f"日K資料轉換失敗：{exc}")
+        return None
+
+    if df.empty:
+        return None
+    if df["ts"].dt.tz is not None:
+        df["ts"] = df["ts"].dt.tz_convert("Asia/Taipei").dt.tz_localize(None)
+    return df.sort_values("ts")
+
+
+def get_recent_daily_bars(
+    api: sj.Shioaji,
+    contract: Any,
+    trading_days: int = SUPPORT_RESISTANCE_DAYS,
+) -> Optional[pd.DataFrame]:
+    """
+    取得最近完整交易日的日K。
+    使用約45個日曆日的分鐘K，彙整為日K，再取最後20個交易日。
+    今天尚未完成的K棒不納入壓力支撐計算。
+    """
+    end_date = now_tw().date() - timedelta(days=1)
+    start_date = end_date - timedelta(days=SUPPORT_RESISTANCE_LOOKBACK_CALENDAR_DAYS)
+
+    try:
+        kbars = api.kbars(
+            contract=contract,
+            start=start_date.strftime("%Y-%m-%d"),
+            end=end_date.strftime("%Y-%m-%d"),
+        )
+    except Exception as exc:
+        print(f"取得近20日日K失敗 {getattr(contract, 'code', '')}: {exc}")
+        return None
+
+    raw = _kbars_to_intraday_df(kbars)
+    if raw is None or raw.empty:
+        return None
+
+    raw["date"] = raw["ts"].dt.date
+    daily = raw.groupby("date", sort=True).agg(
+        open=("open", "first"),
+        high=("high", "max"),
+        low=("low", "min"),
+        close=("close", "last"),
+        volume=("volume", "sum"),
+    )
+    daily = daily[daily["volume"] > 0].tail(trading_days)
+    if len(daily) < 5:
+        return None
+    return daily
+
+
+def calculate_support_resistance(
+    daily: pd.DataFrame,
+    current_price: float,
+) -> Dict[str, Any]:
+    """
+    以最近20個完整交易日尋找離現價最近的局部波段高、低點。
+    找不到適合的局部高低點時，改用20日最高／最低。
+    壓力支撐以中心價上下0.3%顯示為區間。
+    """
+    highs = daily["high"].astype(float)
+    lows = daily["low"].astype(float)
+
+    local_highs = []
+    local_lows = []
+    for i in range(2, len(daily) - 2):
+        h = float(highs.iloc[i])
+        l = float(lows.iloc[i])
+        if h >= float(highs.iloc[i - 2:i + 3].max()):
+            local_highs.append(h)
+        if l <= float(lows.iloc[i - 2:i + 3].min()):
+            local_lows.append(l)
+
+    twenty_high = float(highs.max())
+    twenty_low = float(lows.min())
+
+    higher_levels = sorted({p for p in local_highs if p > current_price})
+    lower_levels = sorted({p for p in local_lows if p < current_price}, reverse=True)
+
+    resistance = higher_levels[0] if higher_levels else twenty_high
+    support = lower_levels[0] if lower_levels else twenty_low
+
+    resistance_low = round_down_tick(resistance * (1 - SUPPORT_RESISTANCE_ZONE_RATIO))
+    resistance_high = round_up_tick(resistance * (1 + SUPPORT_RESISTANCE_ZONE_RATIO))
+    support_low = round_down_tick(support * (1 - SUPPORT_RESISTANCE_ZONE_RATIO))
+    support_high = round_up_tick(support * (1 + SUPPORT_RESISTANCE_ZONE_RATIO))
+
+    resistance_distance = (
+        (resistance - current_price) / current_price * 100
+        if current_price > 0 else 0.0
+    )
+    support_distance = (
+        (current_price - support) / current_price * 100
+        if current_price > 0 else 0.0
+    )
+
+    if current_price > twenty_high:
+        space_text = "已突破20日高點 🚀"
+    elif resistance_distance < 0.8:
+        space_text = "上方空間偏小 ⚠️"
+    elif resistance_distance <= 2.0:
+        space_text = "上方空間一般"
+    else:
+        space_text = "上方空間充足 ✅"
+
+    return {
+        "近期壓力中心": round(resistance, 2),
+        "近期壓力區": f"{resistance_low}～{resistance_high}",
+        "近期支撐中心": round(support, 2),
+        "近期支撐區": f"{support_low}～{support_high}",
+        "20日最高": round(twenty_high, 2),
+        "20日最低": round(twenty_low, 2),
+        "距壓力%": round(resistance_distance, 2),
+        "距支撐%": round(support_distance, 2),
+        "空間評估": space_text,
+    }
+
+
+def get_support_resistance_info(
+    api: sj.Shioaji,
+    contract: Any,
+    current_price: float,
+) -> Dict[str, Any]:
+    daily = get_recent_daily_bars(api, contract)
+    if daily is None:
+        return {
+            "近期壓力中心": None,
+            "近期壓力區": "資料不足",
+            "近期支撐中心": None,
+            "近期支撐區": "資料不足",
+            "20日最高": "資料不足",
+            "20日最低": "資料不足",
+            "距壓力%": None,
+            "距支撐%": None,
+            "空間評估": "資料不足",
+        }
+    return calculate_support_resistance(daily, current_price)
 
 def now_tw() -> datetime:
     return datetime.now(TZ)
@@ -159,10 +345,24 @@ def format_discord(rows: List[Dict[str, Any]]) -> str:
 
     lines = [f"【09:00 Mr.Price開盤觀察池】共 {len(rows)} 檔"]
     for i, r in enumerate(rows[:TOP_PRINT_N], 1):
-        lines.append(
-            f"{i}. {r['股票代號']} {r['股票名稱']}｜漲幅 {r['漲幅']}%｜量 {int(r['成交量'])}｜成交值 {r['成交值(億)']}億｜強度 {r['強度分數']}"
+        pressure_distance = r.get("距壓力%")
+        support_distance = r.get("距支撐%")
+        pressure_text = (
+            f"{pressure_distance:+.2f}%"
+            if isinstance(pressure_distance, (int, float))
+            else "資料不足"
         )
-    lines.append("\n後續重點：09:05 確認第一根5分K量能，09:10 看第二根是否突破第一根爆量K高點。")
+        support_text = (
+            f"-{support_distance:.2f}%"
+            if isinstance(support_distance, (int, float))
+            else "資料不足"
+        )
+        lines.extend([
+            f"{i}. {r['股票代號']} {r['股票名稱']}｜漲幅 {r['漲幅']}%｜量 {int(r['成交量'])}｜成交值 {r['成交值(億)']}億｜強度 {r['強度分數']}",
+            f"   壓力區 {r.get('近期壓力區', '資料不足')}（距離 {pressure_text}）｜{r.get('空間評估', '')}",
+            f"   支撐區 {r.get('近期支撐區', '資料不足')}（距離 {support_text}）｜20日高低 {r.get('20日最高', '資料不足')}／{r.get('20日最低', '資料不足')}",
+        ])
+    lines.append("\n壓力支撐使用最近20個完整交易日；壓力過近只提示、不直接排除。")
     return "\n".join(lines)
 
 
@@ -223,6 +423,30 @@ def run() -> None:
 
     rows.sort(key=lambda r: (float(r["漲幅"]), float(r["成交值(億)"]), float(r["成交量"])), reverse=True)
     rows = rows[:TOP_PRINT_N]
+
+    # 僅對最後入選的標的計算近20個交易日壓力支撐，避免全市場大量呼叫。
+    for row in rows:
+        try:
+            contract = api.Contracts.Stocks[str(row["股票代號"])]
+            row.update(
+                get_support_resistance_info(
+                    api,
+                    contract,
+                    float(row["目前價"]),
+                )
+            )
+        except Exception as exc:
+            print(f"計算壓力支撐失敗 {row.get('股票代號', '')}: {exc}")
+            row.update({
+                "近期壓力區": "資料不足",
+                "近期支撐區": "資料不足",
+                "20日最高": "資料不足",
+                "20日最低": "資料不足",
+                "距壓力%": None,
+                "距支撐%": None,
+                "空間評估": "資料不足",
+            })
+
     save_candidates(rows)
 
     for r in rows:

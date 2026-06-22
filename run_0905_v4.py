@@ -39,9 +39,9 @@ REQUIRE_CLOSE_BREAK_FIRST_HIGH = os.getenv("REQUIRE_CLOSE_BREAK_FIRST_HIGH", "tr
 # 09:05 後盤中突破監看設定
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "10"))
 MONITOR_MINUTES = int(os.getenv("MONITOR_MINUTES", "5"))
-BREAKOUT_TICKS = int(os.getenv("BREAKOUT_TICKS", "2"))
+BREAKOUT_TICKS = int(os.getenv("BREAKOUT_TICKS", "1"))
 MAX_FIRST_UPPER_WICK_RATIO = float(os.getenv("MAX_FIRST_UPPER_WICK_RATIO", "0.35"))
-MIN_VOLUME_SPEED_RATIO = float(os.getenv("MIN_VOLUME_SPEED_RATIO", "1.20"))
+MIN_VOLUME_FLOW_RATIO = float(os.getenv("MIN_VOLUME_FLOW_RATIO", "0.80"))
 MIN_FIRST_VOLUME_MULTIPLIER = float(os.getenv("MIN_FIRST_VOLUME_MULTIPLIER", "1.50"))
 
 TWSE_HOLIDAYS = {
@@ -54,6 +54,191 @@ EXCLUDE_KY = True
 EXCLUDE_ETF = True
 EXCLUDE_FINANCIAL = os.getenv("EXCLUDE_FINANCIAL", "false").lower() in {"1", "true", "yes"}
 
+
+
+SUPPORT_RESISTANCE_DAYS = int(os.getenv("SUPPORT_RESISTANCE_DAYS", "20"))
+SUPPORT_RESISTANCE_LOOKBACK_CALENDAR_DAYS = int(
+    os.getenv("SUPPORT_RESISTANCE_LOOKBACK_CALENDAR_DAYS", "45")
+)
+SUPPORT_RESISTANCE_ZONE_RATIO = float(
+    os.getenv("SUPPORT_RESISTANCE_ZONE_RATIO", "0.003")
+)
+
+
+def tick_size(price: float) -> float:
+    if price < 10:
+        return 0.01
+    if price < 50:
+        return 0.05
+    if price < 100:
+        return 0.1
+    if price < 500:
+        return 0.5
+    if price < 1000:
+        return 1.0
+    return 5.0
+
+
+def round_up_tick(price: float) -> float:
+    import math
+    step = tick_size(price)
+    return round(math.ceil(price / step - 1e-9) * step, 2)
+
+
+def round_down_tick(price: float) -> float:
+    import math
+    step = tick_size(price)
+    return round(math.floor(price / step + 1e-9) * step, 2)
+
+
+def _kbars_to_intraday_df(kbars: Any) -> Optional[pd.DataFrame]:
+    try:
+        df = pd.DataFrame({
+            "ts": pd.to_datetime(getattr(kbars, "ts")),
+            "open": getattr(kbars, "Open"),
+            "high": getattr(kbars, "High"),
+            "low": getattr(kbars, "Low"),
+            "close": getattr(kbars, "Close"),
+            "volume": getattr(kbars, "Volume"),
+        })
+    except Exception as exc:
+        print(f"日K資料轉換失敗：{exc}")
+        return None
+
+    if df.empty:
+        return None
+    if df["ts"].dt.tz is not None:
+        df["ts"] = df["ts"].dt.tz_convert("Asia/Taipei").dt.tz_localize(None)
+    return df.sort_values("ts")
+
+
+def get_recent_daily_bars(
+    api: sj.Shioaji,
+    contract: Any,
+    trading_days: int = SUPPORT_RESISTANCE_DAYS,
+) -> Optional[pd.DataFrame]:
+    """
+    取得最近完整交易日的日K。
+    使用約45個日曆日的分鐘K，彙整為日K，再取最後20個交易日。
+    今天尚未完成的K棒不納入壓力支撐計算。
+    """
+    end_date = now_tw().date() - timedelta(days=1)
+    start_date = end_date - timedelta(days=SUPPORT_RESISTANCE_LOOKBACK_CALENDAR_DAYS)
+
+    try:
+        kbars = api.kbars(
+            contract=contract,
+            start=start_date.strftime("%Y-%m-%d"),
+            end=end_date.strftime("%Y-%m-%d"),
+        )
+    except Exception as exc:
+        print(f"取得近20日日K失敗 {getattr(contract, 'code', '')}: {exc}")
+        return None
+
+    raw = _kbars_to_intraday_df(kbars)
+    if raw is None or raw.empty:
+        return None
+
+    raw["date"] = raw["ts"].dt.date
+    daily = raw.groupby("date", sort=True).agg(
+        open=("open", "first"),
+        high=("high", "max"),
+        low=("low", "min"),
+        close=("close", "last"),
+        volume=("volume", "sum"),
+    )
+    daily = daily[daily["volume"] > 0].tail(trading_days)
+    if len(daily) < 5:
+        return None
+    return daily
+
+
+def calculate_support_resistance(
+    daily: pd.DataFrame,
+    current_price: float,
+) -> Dict[str, Any]:
+    """
+    以最近20個完整交易日尋找離現價最近的局部波段高、低點。
+    找不到適合的局部高低點時，改用20日最高／最低。
+    壓力支撐以中心價上下0.3%顯示為區間。
+    """
+    highs = daily["high"].astype(float)
+    lows = daily["low"].astype(float)
+
+    local_highs = []
+    local_lows = []
+    for i in range(2, len(daily) - 2):
+        h = float(highs.iloc[i])
+        l = float(lows.iloc[i])
+        if h >= float(highs.iloc[i - 2:i + 3].max()):
+            local_highs.append(h)
+        if l <= float(lows.iloc[i - 2:i + 3].min()):
+            local_lows.append(l)
+
+    twenty_high = float(highs.max())
+    twenty_low = float(lows.min())
+
+    higher_levels = sorted({p for p in local_highs if p > current_price})
+    lower_levels = sorted({p for p in local_lows if p < current_price}, reverse=True)
+
+    resistance = higher_levels[0] if higher_levels else twenty_high
+    support = lower_levels[0] if lower_levels else twenty_low
+
+    resistance_low = round_down_tick(resistance * (1 - SUPPORT_RESISTANCE_ZONE_RATIO))
+    resistance_high = round_up_tick(resistance * (1 + SUPPORT_RESISTANCE_ZONE_RATIO))
+    support_low = round_down_tick(support * (1 - SUPPORT_RESISTANCE_ZONE_RATIO))
+    support_high = round_up_tick(support * (1 + SUPPORT_RESISTANCE_ZONE_RATIO))
+
+    resistance_distance = (
+        (resistance - current_price) / current_price * 100
+        if current_price > 0 else 0.0
+    )
+    support_distance = (
+        (current_price - support) / current_price * 100
+        if current_price > 0 else 0.0
+    )
+
+    if current_price > twenty_high:
+        space_text = "已突破20日高點 🚀"
+    elif resistance_distance < 0.8:
+        space_text = "上方空間偏小 ⚠️"
+    elif resistance_distance <= 2.0:
+        space_text = "上方空間一般"
+    else:
+        space_text = "上方空間充足 ✅"
+
+    return {
+        "近期壓力中心": round(resistance, 2),
+        "近期壓力區": f"{resistance_low}～{resistance_high}",
+        "近期支撐中心": round(support, 2),
+        "近期支撐區": f"{support_low}～{support_high}",
+        "20日最高": round(twenty_high, 2),
+        "20日最低": round(twenty_low, 2),
+        "距壓力%": round(resistance_distance, 2),
+        "距支撐%": round(support_distance, 2),
+        "空間評估": space_text,
+    }
+
+
+def get_support_resistance_info(
+    api: sj.Shioaji,
+    contract: Any,
+    current_price: float,
+) -> Dict[str, Any]:
+    daily = get_recent_daily_bars(api, contract)
+    if daily is None:
+        return {
+            "近期壓力中心": None,
+            "近期壓力區": "資料不足",
+            "近期支撐中心": None,
+            "近期支撐區": "資料不足",
+            "20日最高": "資料不足",
+            "20日最低": "資料不足",
+            "距壓力%": None,
+            "距支撐%": None,
+            "空間評估": "資料不足",
+        }
+    return calculate_support_resistance(daily, current_price)
 
 def now_tw() -> datetime:
     return datetime.now(TZ)
@@ -355,19 +540,28 @@ def intraday_vwap_from_ticks(df: pd.DataFrame) -> Optional[float]:
     return float((day["price"].astype(float) * volume).sum() / volume.sum())
 
 
-def recent_volume_speed(df: pd.DataFrame) -> Tuple[float, float, float]:
-    """回傳最近完整/進行中 1 分鐘量、前 1 分鐘量、兩者比率。"""
+def recent_volume_flow(df: pd.DataFrame) -> Tuple[float, float, float]:
+    """
+    回傳最近 30 秒量、前一個 30 秒量、兩者比率。
+
+    「持續放量」不是要求目前這段一定大於前一根 5 分 K，
+    而是最近兩段 30 秒都有成交，且最新 30 秒量不能比前 30 秒
+    明顯萎縮超過 20%（預設比率 0.80）。
+    """
     if df.empty:
         return 0.0, 0.0, 0.0
+
     now_naive = now_tw().replace(tzinfo=None)
-    current_start = now_naive.replace(second=0, microsecond=0)
-    previous_start = current_start - timedelta(minutes=1)
-    current = df[(df["ts"] >= current_start) & (df["ts"] <= now_naive)]
-    previous = df[(df["ts"] >= previous_start) & (df["ts"] < current_start)]
-    current_vol = float(current["volume"].sum()) if not current.empty else 0.0
+    recent_start = now_naive - timedelta(seconds=30)
+    previous_start = now_naive - timedelta(seconds=60)
+
+    recent = df[(df["ts"] > recent_start) & (df["ts"] <= now_naive)]
+    previous = df[(df["ts"] > previous_start) & (df["ts"] <= recent_start)]
+
+    recent_vol = float(recent["volume"].sum()) if not recent.empty else 0.0
     previous_vol = float(previous["volume"].sum()) if not previous.empty else 0.0
-    ratio = current_vol / previous_vol if previous_vol > 0 else (999.0 if current_vol > 0 else 0.0)
-    return current_vol, previous_vol, ratio
+    ratio = recent_vol / previous_vol if previous_vol > 0 else 0.0
+    return recent_vol, previous_vol, ratio
 
 
 def previous_5bar_volume_average(bars: pd.DataFrame, first_time: datetime) -> Optional[float]:
@@ -434,7 +628,7 @@ OUTPUT_FILE = os.getenv("BREAKOUTS_FILE", "breakouts_0905.json")
 
 def save_results(rows: List[Dict[str, Any]]) -> None:
     payload = {
-        "strategy": "0905_intraday_breakout_v4",
+        "strategy": "0905_sustained_volume_breakout_v4",
         "generated_at": now_tw().strftime("%Y-%m-%d %H:%M:%S"),
         "count": len(rows),
         "results": rows,
@@ -445,10 +639,12 @@ def save_results(rows: List[Dict[str, Any]]) -> None:
 
 def format_breakout_alert(r: Dict[str, Any]) -> str:
     return "\n".join([
-        "【09:05後 即時突破提醒】",
+        "【09:05 持續放量突破提醒】",
         f"{r['股票代號']} {r['股票名稱']}｜漲幅 {r['漲幅']}%｜成交值 {r['成交值(億)']}億",
         f"現價 {r['目前價']}｜第一根高點 {r['第一根高點']}｜突破門檻 {r['突破門檻']}",
-        f"VWAP {r['VWAP']}｜量速 {r['量速比']} 倍｜第一根上影比例 {r['第一根上影比例']}",
+        f"VWAP {r['VWAP']}｜近30秒量 {r['近30秒量']}｜前30秒量 {r['前30秒量']}｜持續量比 {r['持續量比']} 倍",
+        f"壓力區 {r.get('近期壓力區', '資料不足')}｜支撐區 {r.get('近期支撐區', '資料不足')}｜{r.get('空間評估', '')}",
+        f"20日高低 {r.get('20日最高', '資料不足')}／{r.get('20日最低', '資料不足')}｜距壓力 {r.get('距壓力%', '資料不足')}%",
         f"參考進場 {r['參考進場']}｜防守價 {r['防守價']}｜目標1 {r['目標1']}｜目標2 {r['目標2']}",
         "提醒：這是條件警示，不代表保證上漲；下單前仍需確認委買賣與滑價。",
     ])
@@ -468,7 +664,7 @@ def run() -> None:
         candidates = candidates[:MAX_KBAR_CHECK]
 
     if not candidates:
-        msg = "【09:05後 即時突破提醒】今日沒有可監看的 09:00 候選股。"
+        msg = "【09:05 持續放量突破提醒】今日沒有可監看的 09:00 候選股。"
         print(msg)
         save_results([])
         discord_send(msg)
@@ -481,7 +677,7 @@ def run() -> None:
 
     print(
         f"=== 09:05後盤中突破監看開始，共 {len(candidates)} 檔；"
-        f"每 {POLL_INTERVAL_SECONDS} 秒掃描，約 {MONITOR_MINUTES} 分鐘 ==="
+        f"每 {POLL_INTERVAL_SECONDS} 秒掃描，約 {MONITOR_MINUTES} 分鐘；持續量比門檻 {MIN_VOLUME_FLOW_RATIO} ==="
     )
 
     while now_tw() < monitor_end:
@@ -535,35 +731,25 @@ def run() -> None:
             if first is None:
                 continue
 
-            # 第一根需紅 K、上影線不可過長
-            if first["close"] <= first["open"]:
-                continue
+            # 放寬版：不要求第一根一定紅 K、量能黃金交叉、
+            # 多頭排列或第一根量大於前一根 5 分 K。
+            # 只保留盤中均價線與「持續有量」作為基本防守。
             quality_ok, upper_wick_ratio = first_bar_quality(first)
-            if not quality_ok:
-                continue
-
-            bars = get_5m_bars(api, contract)
-            if bars is None:
-                continue
-
-            # 保留影片策略核心：量能黃金交叉、短多趨勢
-            volume_cross = volume_golden_cross(bars, first_time)
-            trend_ok, trend_text, _ = price_trend_state(bars, first_time)
-            if not volume_cross or not trend_ok:
-                continue
-
-            # 第一根需相對先前 5 根有放量
-            prev_avg = previous_5bar_volume_average(bars, first_time)
-            if prev_avg is not None and first["volume"] < prev_avg * MIN_FIRST_VOLUME_MULTIPLIER:
-                continue
 
             vwap = intraday_vwap_from_ticks(ticks)
             if vwap is None or current_price <= vwap:
                 continue
 
-            current_1m, previous_1m, speed_ratio = recent_volume_speed(ticks)
-            if previous_1m <= 0 or speed_ratio < MIN_VOLUME_SPEED_RATIO:
+            recent_30s, previous_30s, flow_ratio = recent_volume_flow(ticks)
+            sustained_volume = (
+                recent_30s > 0
+                and previous_30s > 0
+                and flow_ratio >= MIN_VOLUME_FLOW_RATIO
+            )
+            if not sustained_volume:
                 continue
+
+            trend_text = "持續放量突破"
 
             trigger = round_up_tick(first["high"] + tick_size(first["high"]) * BREAKOUT_TICKS)
             if current_price < trigger:
@@ -573,6 +759,19 @@ def run() -> None:
             stop = round_down_tick(max(first["high"] - tick_size(first["high"]) * 2, entry * 0.994))
             tp1 = round_down_tick(entry * 1.01)
             tp2 = round_down_tick(entry * 1.02)
+
+            level_info = {
+                key: old.get(key)
+                for key in [
+                    "近期壓力中心", "近期壓力區",
+                    "近期支撐中心", "近期支撐區",
+                    "20日最高", "20日最低",
+                    "距壓力%", "距支撐%", "空間評估",
+                ]
+                if old.get(key) is not None
+            }
+            if not level_info or level_info.get("近期壓力區") in {None, "資料不足"}:
+                level_info = get_support_resistance_info(api, contract, current_price)
 
             result = {
                 "股票代號": code,
@@ -588,9 +787,9 @@ def run() -> None:
                 "第一根上影比例": f"{upper_wick_ratio:.0%}",
                 "突破門檻": trigger,
                 "VWAP": round(vwap, 2),
-                "目前1分鐘量": round(current_1m, 0),
-                "前1分鐘量": round(previous_1m, 0),
-                "量速比": round(speed_ratio, 2),
+                "近30秒量": round(recent_30s, 0),
+                "前30秒量": round(previous_30s, 0),
+                "持續量比": round(flow_ratio, 2),
                 "趨勢狀態": trend_text,
                 "參考進場": entry,
                 "防守價": stop,
@@ -598,6 +797,7 @@ def run() -> None:
                 "目標2": tp2,
                 "更新時間": now_tw().strftime("%Y-%m-%d %H:%M:%S"),
             }
+            result.update(level_info)
             alerted_codes.add(code)
             all_results.append(result)
             discord_send(format_breakout_alert(result))
@@ -607,7 +807,7 @@ def run() -> None:
 
     save_results(all_results)
     if not all_results:
-        discord_send("【09:05後 即時突破提醒】監看期間沒有符合條件的標的。")
+        discord_send("【09:05 持續放量突破提醒】監看期間沒有符合條件的標的。")
     print(f"=== 09:05後盤中突破監看結束，共提醒 {len(all_results)} 檔 ===")
 
 
