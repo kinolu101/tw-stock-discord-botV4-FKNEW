@@ -240,6 +240,95 @@ def get_support_resistance_info(
         }
     return calculate_support_resistance(daily, current_price)
 
+
+MAX_OPEN_GAP_TICKS = int(os.getenv("MAX_OPEN_GAP_TICKS", "10"))
+
+
+def count_price_ticks(price_a: float, price_b: float, max_count: int = 1000) -> int:
+    """
+    計算兩個價格之間相差幾個台股跳動單位。
+    因不同價格區間的 Tick 大小不同，因此逐 Tick 計算。
+    """
+    if price_a <= 0 or price_b <= 0:
+        return max_count
+
+    low = min(price_a, price_b)
+    high = max(price_a, price_b)
+    current = low
+    count = 0
+
+    while current + 1e-9 < high and count < max_count:
+        current = round(current + tick_size(current), 2)
+        count += 1
+
+    return count
+
+
+def get_previous_last_5m_close(
+    api: sj.Shioaji,
+    contract: Any,
+) -> Optional[float]:
+    """
+    取得昨天（最近一個交易日）最後一根 5 分 K 的收盤價。
+    只抓到昨天為止，不使用今天尚未走完的資料。
+    """
+    end_date = now_tw().date() - timedelta(days=1)
+    start_date = end_date - timedelta(days=10)
+
+    try:
+        kbars = api.kbars(
+            contract=contract,
+            start=start_date.strftime("%Y-%m-%d"),
+            end=end_date.strftime("%Y-%m-%d"),
+        )
+    except Exception as exc:
+        print(f"取得昨日最後5分K失敗 {getattr(contract, 'code', '')}: {exc}")
+        return None
+
+    try:
+        df = pd.DataFrame({
+            "ts": pd.to_datetime(kbars.ts),
+            "close": kbars.Close,
+            "volume": kbars.Volume,
+        })
+    except Exception:
+        return None
+
+    if df.empty:
+        return None
+
+    if df["ts"].dt.tz is not None:
+        df["ts"] = df["ts"].dt.tz_convert("Asia/Taipei").dt.tz_localize(None)
+
+    df = df[df["volume"].astype(float) > 0].sort_values("ts")
+    if df.empty:
+        return None
+
+    latest_trade_date = df["ts"].dt.date.max()
+    previous_day = df[df["ts"].dt.date == latest_trade_date]
+    if previous_day.empty:
+        return None
+
+    return float(previous_day.iloc[-1]["close"])
+
+
+def opening_gap_check(
+    api: sj.Shioaji,
+    contract: Any,
+    today_first_open: float,
+) -> Tuple[bool, Optional[float], Optional[int]]:
+    """
+    今日第一根 K 開盤價與昨天最後一根 5 分 K 收盤價，
+    相差超過 MAX_OPEN_GAP_TICKS 個跳動單位就排除。
+    資料不足時不誤殺，允許繼續。
+    """
+    previous_close = get_previous_last_5m_close(api, contract)
+    if previous_close is None:
+        return True, None, None
+
+    gap_ticks = count_price_ticks(previous_close, today_first_open)
+    return gap_ticks <= MAX_OPEN_GAP_TICKS, previous_close, gap_ticks
+
 def now_tw() -> datetime:
     return datetime.now(TZ)
 
@@ -640,10 +729,11 @@ def save_results(rows: List[Dict[str, Any]]) -> None:
 def format_breakout_alert(r: Dict[str, Any]) -> str:
     return "\n".join([
         "【09:05 持續放量突破提醒】",
-        f"{r['股票代號']} {r['股票名稱']}｜漲幅 {r['漲幅']}%｜成交值 {r['成交值(億)']}億",
+        f"🔶 {r['股票代號']} {r['股票名稱']}｜漲幅 {r['漲幅']}%｜成交值 {r['成交值(億)']}億",
         f"現價 {r['目前價']}｜第一根高點 {r['第一根高點']}｜突破門檻 {r['突破門檻']}",
+        f"昨末5分K {r.get('昨日最後5分K收盤', '資料不足')}｜今日首根開盤 {r.get('第一根開盤', r.get('目前價', '資料不足'))}｜距離 {r.get('開盤距離Tick', '資料不足')} Tick",
         f"VWAP {r['VWAP']}｜近30秒量 {r['近30秒量']}｜前30秒量 {r['前30秒量']}｜持續量比 {r['持續量比']} 倍",
-        f"壓力區 {r.get('近期壓力區', '資料不足')}｜支撐區 {r.get('近期支撐區', '資料不足')}｜{r.get('空間評估', '')}",
+        f"🔻 壓力區 {r.get('近期壓力區', '資料不足')}｜🔺 支撐區 {r.get('近期支撐區', '資料不足')}｜{r.get('空間評估', '')}",
         f"20日高低 {r.get('20日最高', '資料不足')}／{r.get('20日最低', '資料不足')}｜距壓力 {r.get('距壓力%', '資料不足')}%",
         f"參考進場 {r['參考進場']}｜防守價 {r['防守價']}｜目標1 {r['目標1']}｜目標2 {r['目標2']}",
         "提醒：這是條件警示，不代表保證上漲；下單前仍需確認委買賣與滑價。",
@@ -731,6 +821,14 @@ def run() -> None:
             if first is None:
                 continue
 
+            gap_ok, previous_last_close, opening_gap_ticks = opening_gap_check(
+                api,
+                contract,
+                float(first["open"]),
+            )
+            if not gap_ok:
+                continue
+
             # 放寬版：不要求第一根一定紅 K、量能黃金交叉、
             # 多頭排列或第一根量大於前一根 5 分 K。
             # 只保留盤中均價線與「持續有量」作為基本防守。
@@ -780,9 +878,12 @@ def run() -> None:
                 "成交量": total_volume,
                 "成交值(億)": round(turnover_100m, 2),
                 "目前價": round(current_price, 2),
+                "第一根開盤": round(first["open"], 2),
                 "第一根高點": round(first["high"], 2),
                 "第一根低點": round(first["low"], 2),
                 "第一根收盤": round(first["close"], 2),
+                "昨日最後5分K收盤": round(previous_last_close, 2) if previous_last_close is not None else "資料不足",
+                "開盤距離Tick": opening_gap_ticks if opening_gap_ticks is not None else "資料不足",
                 "第一根量": round(first["volume"], 0),
                 "第一根上影比例": f"{upper_wick_ratio:.0%}",
                 "突破門檻": trigger,
