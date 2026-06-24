@@ -14,7 +14,7 @@
 import json
 import os
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -31,8 +31,12 @@ MIN_CHANGE_RATE = float(os.getenv("MIN_CHANGE_RATE", "1.0"))
 MAX_CHANGE_RATE = float(os.getenv("MAX_CHANGE_RATE", "6.0"))
 MIN_VOLUME = float(os.getenv("MIN_VOLUME", "1000"))
 MIN_TURNOVER_TWD = float(os.getenv("MIN_TURNOVER_TWD", "80000000"))
-TOP_PRINT_N = int(os.getenv("TOP_PRINT_N", "20"))
+TOP_PRINT_N = int(os.getenv("TOP_PRINT_N", "3"))
 HIGH_TURNOVER_POOL_SIZE = int(os.getenv("HIGH_TURNOVER_POOL_SIZE", "200"))
+FOREIGN_LOOKBACK_REPORTS = int(os.getenv("FOREIGN_LOOKBACK_REPORTS", "5"))
+FOREIGN_FETCH_CALENDAR_DAYS = int(os.getenv("FOREIGN_FETCH_CALENDAR_DAYS", "12"))
+REQUIRE_RECENT_FOREIGN_ACTIVITY = os.getenv("REQUIRE_RECENT_FOREIGN_ACTIVITY", "true").lower() in {"1", "true", "yes"}
+FOREIGN_DATA_FAIL_OPEN = os.getenv("FOREIGN_DATA_FAIL_OPEN", "true").lower() in {"1", "true", "yes"}
 
 EXCLUDE_KY = True
 EXCLUDE_ETF = True
@@ -232,6 +236,7 @@ def get_support_resistance_info(
 
 
 MAX_OPEN_GAP_TICKS = int(os.getenv("MAX_OPEN_GAP_TICKS", "10"))
+MAX_EARLY_GAIN_FROM_PREV_CLOSE_PCT = float(os.getenv("MAX_EARLY_GAIN_FROM_PREV_CLOSE_PCT", "3.0"))
 
 
 def count_price_ticks(price_a: float, price_b: float, max_count: int = 1000) -> int:
@@ -317,7 +322,14 @@ def opening_gap_check(
         return True, None, None
 
     gap_ticks = count_price_ticks(previous_close, today_first_open)
-    return gap_ticks <= MAX_OPEN_GAP_TICKS, previous_close, gap_ticks
+
+    # 做多策略只排除向上跳空過大：今日開盤高於昨末5分K超過10 Tick。
+    # 向下跳空不由此條件排除，仍交由其他多方條件判斷。
+    upward_gap_too_large = (
+        today_first_open > previous_close
+        and gap_ticks > MAX_OPEN_GAP_TICKS
+    )
+    return not upward_gap_too_large, previous_close, gap_ticks
 
 def now_tw() -> datetime:
     return datetime.now(TZ)
@@ -447,9 +459,186 @@ def score_candidate(change_rate: float, volume: float, turnover_100m: float, clo
     return min(score, 100)
 
 
+
+def _clean_number(value: Any) -> float:
+    text = str(value or "").replace(",", "").replace("+", "").strip()
+    if text in {"", "--", "---", "None"}:
+        return 0.0
+    try:
+        return float(text)
+    except Exception:
+        return 0.0
+
+
+def _extract_json_tables(payload: Any) -> List[Dict[str, Any]]:
+    """支援 TWSE/TPEX 常見 JSON 格式，回傳含 fields/data 的表格。"""
+    tables: List[Dict[str, Any]] = []
+    if not isinstance(payload, dict):
+        return tables
+    if isinstance(payload.get("fields"), list) and isinstance(payload.get("data"), list):
+        tables.append({"fields": payload["fields"], "data": payload["data"]})
+    for key in ("tables", "aaData"):
+        value = payload.get(key)
+        if key == "tables" and isinstance(value, list):
+            for table in value:
+                if isinstance(table, dict) and isinstance(table.get("fields"), list) and isinstance(table.get("data"), list):
+                    tables.append({"fields": table["fields"], "data": table["data"]})
+    return tables
+
+
+def _find_field_index(fields: List[str], keywords: List[str]) -> Optional[int]:
+    normalized = [str(x).replace(" ", "").replace("　", "") for x in fields]
+    for i, field in enumerate(normalized):
+        if all(keyword in field for keyword in keywords):
+            return i
+    return None
+
+
+def _parse_foreign_table(payload: Any) -> Dict[str, float]:
+    """解析官方法人資料，回傳 股票代號 -> 外資買賣超股數。"""
+    output: Dict[str, float] = {}
+    for table in _extract_json_tables(payload):
+        fields = [str(x) for x in table["fields"]]
+        code_idx = _find_field_index(fields, ["證券代號"])
+        if code_idx is None:
+            code_idx = _find_field_index(fields, ["代號"])
+
+        # 優先抓「外資及陸資(不含外資自營商)-買賣超股數」；
+        # 不同市場欄名略有差異，因此採多組關鍵字相容。
+        net_idx = None
+        candidates = [
+            ["外資及陸資", "買賣超"],
+            ["外資", "買賣超"],
+            ["外資及陸資合計", "買賣超"],
+        ]
+        for keywords in candidates:
+            net_idx = _find_field_index(fields, keywords)
+            if net_idx is not None:
+                break
+        if code_idx is None or net_idx is None:
+            continue
+
+        for row in table["data"]:
+            if not isinstance(row, (list, tuple)) or len(row) <= max(code_idx, net_idx):
+                continue
+            code = str(row[code_idx]).strip().replace("=", "").replace('"', '')
+            if len(code) == 4 and code.isdigit():
+                output[code] = _clean_number(row[net_idx])
+    return output
+
+
+def _fetch_twse_foreign(date_obj) -> Dict[str, float]:
+    url = "https://www.twse.com.tw/rwd/zh/fund/T86"
+    params = {
+        "date": date_obj.strftime("%Y%m%d"),
+        "selectType": "ALLBUT0999",
+        "response": "json",
+    }
+    r = requests.get(url, params=params, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+    r.raise_for_status()
+    return _parse_foreign_table(r.json())
+
+
+def _fetch_tpex_foreign(date_obj) -> Dict[str, float]:
+    # TPEx 新版官網法人日報 JSON。
+    url = "https://www.tpex.org.tw/www/zh-tw/insti/daily_trade"
+    params = {
+        "date": date_obj.strftime("%Y/%m/%d"),
+        "type": "Daily",
+        "sect": "EW",
+        "t": "D",
+        "response": "json",
+    }
+    r = requests.get(url, params=params, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+    r.raise_for_status()
+    return _parse_foreign_table(r.json())
+
+
+def fetch_recent_foreign_history() -> Tuple[List[str], Dict[str, List[float]]]:
+    """
+    抓最近 FOREIGN_LOOKBACK_REPORTS 個有資料的交易日。
+    回傳日期（新到舊）與各股外資買賣超股數（新到舊）。
+    """
+    reports: List[Tuple[str, Dict[str, float]]] = []
+    end_date = now_tw().date() - timedelta(days=1)
+
+    for offset in range(FOREIGN_FETCH_CALENDAR_DAYS):
+        day = end_date - timedelta(days=offset)
+        if day.weekday() >= 5:
+            continue
+        merged: Dict[str, float] = {}
+        try:
+            merged.update(_fetch_twse_foreign(day))
+        except Exception as exc:
+            print(f"TWSE 外資資料取得失敗 {day}: {exc}")
+        try:
+            merged.update(_fetch_tpex_foreign(day))
+        except Exception as exc:
+            print(f"TPEx 外資資料取得失敗 {day}: {exc}")
+
+        if merged:
+            reports.append((day.strftime("%Y-%m-%d"), merged))
+        if len(reports) >= FOREIGN_LOOKBACK_REPORTS:
+            break
+
+    dates = [d for d, _ in reports]
+    history: Dict[str, List[float]] = {}
+    for _, report in reports:
+        all_codes = set(history) | set(report)
+        for code in all_codes:
+            history.setdefault(code, [])
+            history[code].append(float(report.get(code, 0.0)))
+
+    # 補齊每檔長度，避免某市場某日資料缺漏。
+    for code, values in history.items():
+        if len(values) < len(dates):
+            values.extend([0.0] * (len(dates) - len(values)))
+    return dates, history
+
+
+def enrich_foreign_info(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], bool]:
+    dates, history = fetch_recent_foreign_history()
+    data_available = bool(dates and history)
+    print(f"外資資料日期：{dates if dates else '無資料'}")
+
+    enriched: List[Dict[str, Any]] = []
+    for row in rows:
+        code = str(row["股票代號"])
+        values = history.get(code, [])
+        previous_net = values[0] if values else 0.0
+        recent_total = sum(values)
+        recent_active = any(abs(v) > 0 for v in values)
+        recent_buy_days = sum(1 for v in values if v > 0)
+
+        row.update({
+            "外資資料日期": dates,
+            "前一交易日外資買賣超(股)": round(previous_net, 0),
+            "近5日外資買賣超合計(股)": round(recent_total, 0),
+            "近5日外資買超天數": recent_buy_days,
+            "近期外資有交易": recent_active,
+            "前一日外資買超": previous_net > 0,
+        })
+
+        if not data_available and FOREIGN_DATA_FAIL_OPEN:
+            enriched.append(row)
+        elif not REQUIRE_RECENT_FOREIGN_ACTIVITY or recent_active:
+            enriched.append(row)
+
+    return enriched, data_available
+
+
+def format_shares_as_lots(shares: Any) -> str:
+    try:
+        lots = float(shares) / 1000.0
+        sign = "+" if lots > 0 else ""
+        return f"{sign}{lots:,.0f}張"
+    except Exception:
+        return "資料不足"
+
+
 def save_candidates(rows: List[Dict[str, Any]]) -> None:
     payload = {
-        "strategy": "HighTurnoverAmountRank_opening_watchlist_v4",
+        "strategy": "Top3Volume_ForeignPreferred_opening_watchlist_v4",
         "generated_at": now_tw().strftime("%Y-%m-%d %H:%M:%S"),
         "count": len(rows),
         "candidates": rows,
@@ -460,9 +649,9 @@ def save_candidates(rows: List[Dict[str, Any]]) -> None:
 
 def format_discord(rows: List[Dict[str, Any]]) -> str:
     if not rows:
-        return "【09:00 高周轉活躍觀察池】共 0 檔"
+        return "【09:00 最符合策略 TOP 3】本次無符合標的"
 
-    lines = [f"【09:00 高周轉活躍觀察池】共 {len(rows)} 檔"]
+    lines = [f"【09:00 最符合策略 TOP {len(rows)}】量能前三大＋外資優先"]
     for i, r in enumerate(rows[:TOP_PRINT_N], 1):
         pressure_distance = r.get("距壓力%")
         support_distance = r.get("距支撐%")
@@ -477,12 +666,14 @@ def format_discord(rows: List[Dict[str, Any]]) -> str:
             else "資料不足"
         )
         lines.extend([
-            f"{i}. 🔶 {r['股票代號']} {r['股票名稱']}｜漲幅 {r['漲幅']}%｜量 {int(r['成交量'])}｜成交值 {r['成交值(億)']}億｜強度 {r['強度分數']}",
-            f"   昨末5分K {r.get('昨日最後5分K收盤', '資料不足')}｜今日首根開盤 {r.get('開盤價', '資料不足')}｜距離 {r.get('開盤距離Tick', '資料不足')} Tick",
+            f"{i}. 🔶 {r['股票代號']} {r['股票名稱']}｜量能排名 {i}｜量 {int(r['成交量'])}｜漲幅 {r['漲幅']}%｜強度 {r['強度分數']}",
+            f"   🌐 前一日外資 {format_shares_as_lots(r.get('前一交易日外資買賣超(股)', 0))}｜近5日合計 {format_shares_as_lots(r.get('近5日外資買賣超合計(股)', 0))}｜買超 {r.get('近5日外資買超天數', 0)} 天",
+            f"   昨末5分K {r.get('昨日最後5分K收盤', '資料不足')}｜今日首根開盤 {r.get('開盤價', '資料不足')}｜向上距離 {r.get('開盤距離Tick', '資料不足')} Tick",
+            f"   09:00相對昨收漲幅 {r.get('09點相對昨收漲幅%', '資料不足')}%（上限 {MAX_EARLY_GAIN_FROM_PREV_CLOSE_PCT}%）",
             f"   🔻 壓力區 {r.get('近期壓力區', '資料不足')}（距離 {pressure_text}）｜{r.get('空間評估', '')}",
             f"   🔺 支撐區 {r.get('近期支撐區', '資料不足')}（距離 {support_text}）｜20日高低 {r.get('20日最高', '資料不足')}／{r.get('20日最低', '資料不足')}",
         ])
-    lines.append("\n候選池：Shioaji 成交值排行前段（高活躍池）。壓力支撐使用最近20個完整交易日。")
+    lines.append("\n外資觀察最近5個交易日；前一日買超優先。所有固定策略先通過後，才依成交量取3檔。")
     return "\n".join(lines)
 
 
@@ -533,10 +724,22 @@ def run() -> None:
             )
             if not gap_ok:
                 print(
-                    f"排除 {s.code}：今日第一根開盤 {open_price} 與昨日最後5分K收盤 "
-                    f"{previous_last_close} 相差 {opening_gap_ticks} Tick，超過 {MAX_OPEN_GAP_TICKS} Tick"
+                    f"排除 {s.code}：今日首根開盤 {open_price} 高於昨日最後5分K收盤 "
+                    f"{previous_last_close} 超過 {MAX_OPEN_GAP_TICKS} Tick"
                 )
                 continue
+
+            # 09:00 時第一根5分K尚未完成，所以用目前價相對昨末5分K的漲幅做代理。
+            if previous_last_close is not None and previous_last_close > 0:
+                early_gain_pct = (close_price - previous_last_close) / previous_last_close * 100
+                if early_gain_pct > MAX_EARLY_GAIN_FROM_PREV_CLOSE_PCT:
+                    print(
+                        f"排除 {s.code}：09:00早盤漲幅 {early_gain_pct:.2f}% "
+                        f"超過 {MAX_EARLY_GAIN_FROM_PREV_CLOSE_PCT:.2f}%"
+                    )
+                    continue
+            else:
+                early_gain_pct = None
 
             score = score_candidate(change_rate, total_volume, turnover_twd / 100000000, close_price, open_price)
             rows.append({
@@ -549,16 +752,31 @@ def run() -> None:
                 "開盤價": open_price,
                 "昨日最後5分K收盤": round(previous_last_close, 2) if previous_last_close is not None else "資料不足",
                 "開盤距離Tick": opening_gap_ticks if opening_gap_ticks is not None else "資料不足",
+                "09點相對昨收漲幅%": round(early_gain_pct, 2) if early_gain_pct is not None else "資料不足",
                 "目前價": close_price,
                 "是否可當沖": "是",
                 "強度分數": score,
                 "更新時間": updated_at,
             })
 
-    rows.sort(key=lambda r: (float(r["漲幅"]), float(r["成交值(億)"]), float(r["成交量"])), reverse=True)
+    # 加入最近5個交易日外資資料。近期必須有外資交易；
+    # 選擇時優先「前一交易日外資買超」，再從同級中取成交量最大的3檔。
+    rows, foreign_data_available = enrich_foreign_info(rows)
+    rows.sort(
+        key=lambda r: (
+            1 if r.get("前一日外資買超") else 0,
+            float(r.get("成交量", 0)),
+            float(r.get("成交值(億)", 0)),
+            int(r.get("強度分數", 0)),
+        ),
+        reverse=True,
+    )
     rows = rows[:TOP_PRINT_N]
 
-    # 僅對最後入選的標的計算近20個交易日壓力支撐，避免全市場大量呼叫。
+    if not foreign_data_available:
+        print("警告：官方外資資料整體無法取得，本次依 FOREIGN_DATA_FAIL_OPEN 設定處理。")
+
+    # 僅對最後3檔計算近20個交易日壓力支撐，避免大量呼叫。
     for row in rows:
         try:
             contract = api.Contracts.Stocks[str(row["股票代號"])]

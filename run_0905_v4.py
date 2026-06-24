@@ -242,6 +242,7 @@ def get_support_resistance_info(
 
 
 MAX_OPEN_GAP_TICKS = int(os.getenv("MAX_OPEN_GAP_TICKS", "10"))
+MAX_FIRST_5M_GAIN_PCT = float(os.getenv("MAX_FIRST_5M_GAIN_PCT", "3.0"))
 
 
 def count_price_ticks(price_a: float, price_b: float, max_count: int = 1000) -> int:
@@ -327,7 +328,11 @@ def opening_gap_check(
         return True, None, None
 
     gap_ticks = count_price_ticks(previous_close, today_first_open)
-    return gap_ticks <= MAX_OPEN_GAP_TICKS, previous_close, gap_ticks
+    upward_gap_too_large = (
+        today_first_open > previous_close
+        and gap_ticks > MAX_OPEN_GAP_TICKS
+    )
+    return not upward_gap_too_large, previous_close, gap_ticks
 
 def now_tw() -> datetime:
     return datetime.now(TZ)
@@ -731,7 +736,8 @@ def format_breakout_alert(r: Dict[str, Any]) -> str:
         "【09:05 持續放量突破提醒】",
         f"🔶 {r['股票代號']} {r['股票名稱']}｜漲幅 {r['漲幅']}%｜成交值 {r['成交值(億)']}億",
         f"現價 {r['目前價']}｜第一根高點 {r['第一根高點']}｜突破門檻 {r['突破門檻']}",
-        f"昨末5分K {r.get('昨日最後5分K收盤', '資料不足')}｜今日首根開盤 {r.get('第一根開盤', r.get('目前價', '資料不足'))}｜距離 {r.get('開盤距離Tick', '資料不足')} Tick",
+        f"昨末5分K {r.get('昨日最後5分K收盤', '資料不足')}｜今日首根開盤 {r.get('第一根開盤', r.get('目前價', '資料不足'))}｜向上距離 {r.get('開盤距離Tick', '資料不足')} Tick",
+        f"第一根相對昨收漲幅 {r.get('第一根相對昨收漲幅%', '資料不足')}%（上限 {MAX_FIRST_5M_GAIN_PCT}%）",
         f"VWAP {r['VWAP']}｜近30秒量 {r['近30秒量']}｜前30秒量 {r['前30秒量']}｜持續量比 {r['持續量比']} 倍",
         f"🔻 壓力區 {r.get('近期壓力區', '資料不足')}｜🔺 支撐區 {r.get('近期支撐區', '資料不足')}｜{r.get('空間評估', '')}",
         f"20日高低 {r.get('20日最高', '資料不足')}／{r.get('20日最低', '資料不足')}｜距壓力 {r.get('距壓力%', '資料不足')}%",
@@ -829,6 +835,18 @@ def run() -> None:
             if not gap_ok:
                 continue
 
+            # 第一根完整5分K不可漲得過高：以昨末5分K收盤為基準，預設上限3%。
+            if previous_last_close is not None and previous_last_close > 0:
+                first_5m_gain_pct = (
+                    (float(first["close"]) - previous_last_close)
+                    / previous_last_close
+                    * 100
+                )
+                if first_5m_gain_pct > MAX_FIRST_5M_GAIN_PCT:
+                    continue
+            else:
+                first_5m_gain_pct = None
+
             # 放寬版：不要求第一根一定紅 K、量能黃金交叉、
             # 多頭排列或第一根量大於前一根 5 分 K。
             # 只保留盤中均價線與「持續有量」作為基本防守。
@@ -884,6 +902,7 @@ def run() -> None:
                 "第一根收盤": round(first["close"], 2),
                 "昨日最後5分K收盤": round(previous_last_close, 2) if previous_last_close is not None else "資料不足",
                 "開盤距離Tick": opening_gap_ticks if opening_gap_ticks is not None else "資料不足",
+                "第一根相對昨收漲幅%": round(first_5m_gain_pct, 2) if first_5m_gain_pct is not None else "資料不足",
                 "第一根量": round(first["volume"], 0),
                 "第一根上影比例": f"{upper_wick_ratio:.0%}",
                 "突破門檻": trigger,

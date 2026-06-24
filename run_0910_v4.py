@@ -233,6 +233,7 @@ def get_support_resistance_info(
 
 
 MAX_OPEN_GAP_TICKS = int(os.getenv("MAX_OPEN_GAP_TICKS", "10"))
+MAX_FIRST_5M_GAIN_PCT = float(os.getenv("MAX_FIRST_5M_GAIN_PCT", "3.0"))
 
 
 def count_price_ticks(price_a: float, price_b: float, max_count: int = 1000) -> int:
@@ -318,7 +319,11 @@ def opening_gap_check(
         return True, None, None
 
     gap_ticks = count_price_ticks(previous_close, today_first_open)
-    return gap_ticks <= MAX_OPEN_GAP_TICKS, previous_close, gap_ticks
+    upward_gap_too_large = (
+        today_first_open > previous_close
+        and gap_ticks > MAX_OPEN_GAP_TICKS
+    )
+    return not upward_gap_too_large, previous_close, gap_ticks
 
 def now_tw() -> datetime:
     return datetime.now(TZ)
@@ -637,7 +642,8 @@ def format_discord(results: List[Dict[str, Any]]) -> str:
             "",
             f"{i}. 🔶 {r['股票代號']} {r['股票名稱']}｜漲幅 {r['漲幅']}%｜成交值 {r['成交值(億)']}億",
             f"條件：{r['突破條件']}｜量能：{r['量能黃金交叉']}｜趨勢：{r['趨勢狀態']}｜均價線：{r['均價線狀態']}",
-            f"昨末5分K：{r.get('昨日最後5分K收盤', '資料不足')}｜今日首根開盤：{r.get('第一根開盤', '資料不足')}｜距離：{r.get('開盤距離Tick', '資料不足')} Tick",
+            f"昨末5分K：{r.get('昨日最後5分K收盤', '資料不足')}｜今日首根開盤：{r.get('第一根開盤', '資料不足')}｜向上距離：{r.get('開盤距離Tick', '資料不足')} Tick",
+            f"第一根相對昨收漲幅：{r.get('第一根相對昨收漲幅%', '資料不足')}%（上限 {MAX_FIRST_5M_GAIN_PCT}%）",
             f"第一根高點：{r['第一根高點']}｜第二根高點：{r['第二根高點']}｜第二根收盤：{r['第二根收盤']}",
             f"🔻 壓力區：{r.get('近期壓力區', '資料不足')}｜🔺 支撐區：{r.get('近期支撐區', '資料不足')}｜{r.get('空間評估', '')}",
             f"20日高低：{r.get('20日最高', '資料不足')}／{r.get('20日最低', '資料不足')}｜距壓力：{r.get('距壓力%', '資料不足')}%",
@@ -692,6 +698,18 @@ def run() -> None:
         )
         if not gap_ok:
             continue
+
+        # 第一根完整5分K不可漲得過高：以昨末5分K收盤為基準，預設上限3%。
+        if previous_last_close is not None and previous_last_close > 0:
+            first_5m_gain_pct = (
+                (first_close - previous_last_close)
+                / previous_last_close
+                * 100
+            )
+            if first_5m_gain_pct > MAX_FIRST_5M_GAIN_PCT:
+                continue
+        else:
+            first_5m_gain_pct = None
         first_vol = float(first["volume"])
         second_high = float(second["high"])
         second_close = float(second["close"])
@@ -757,6 +775,7 @@ def run() -> None:
             "第一根低點": round(first_low, 2),
             "昨日最後5分K收盤": round(previous_last_close, 2) if previous_last_close is not None else "資料不足",
             "開盤距離Tick": opening_gap_ticks if opening_gap_ticks is not None else "資料不足",
+            "第一根相對昨收漲幅%": round(first_5m_gain_pct, 2) if first_5m_gain_pct is not None else "資料不足",
             "第一根收盤": round(first_close, 2),
             "第一根量": first_vol,
             "第二根高點": round(second_high, 2),
