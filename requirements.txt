@@ -1,4 +1,5 @@
-shioaji
-pandas
-python-dotenv
-requests
+shioaji>=1.2,<2
+pandas>=2.0,<3
+requests>=2.31,<3
+python-dotenv>=1,<2
+google-cloud-storage>=2,<4
