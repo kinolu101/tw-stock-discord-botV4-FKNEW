@@ -1,13 +1,13 @@
 """
-09:00 Mr.Price 開盤策略候選股 V4
+09:00 反彈失敗放空觀察池 V4
 
 策略重點：
-- 先用高周轉/高成交值與開盤漲幅建立觀察池
+- 先用高成交值與開盤跌幅建立觀察池
 - 排除 ETF / KY / 不可當沖
-- 避免一開盤漲太高，預設漲幅 1%～6%
+- 避免追空過度下跌，預設跌幅 -5%～-1%
 - 結果寫入 candidates_0900.json，供 09:05 / 09:10 使用
 
-注意：影片中的完整進場條件重點在「量能黃金交叉 + 多頭排列 + 股價站均價線 + 第二根 5 分 K 突破第一根爆量 K 高點」。
+注意：此處僅為弱勢股觀察池；09:05與09:10仍需改寫成反彈失敗確認，不可沿用舊做多判斷。
 09:00 這支只先做觀察池，真正進場訊號放在 run_0910_v4.py。
 """
 
@@ -27,8 +27,8 @@ TZ = ZoneInfo("Asia/Taipei")
 OUTPUT_FILE = os.getenv("CANDIDATES_FILE", "candidates_0900.json")
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "")
 
-MIN_CHANGE_RATE = float(os.getenv("MIN_CHANGE_RATE", "1.0"))
-MAX_CHANGE_RATE = float(os.getenv("MAX_CHANGE_RATE", "6.0"))
+MIN_CHANGE_RATE = float(os.getenv("SHORT_MIN_CHANGE_RATE", "-5.0"))
+MAX_CHANGE_RATE = float(os.getenv("SHORT_MAX_CHANGE_RATE", "-1.0"))
 MIN_VOLUME = float(os.getenv("MIN_VOLUME", "1000"))
 MIN_TURNOVER_TWD = float(os.getenv("MIN_TURNOVER_TWD", "80000000"))
 TOP_PRINT_N = int(os.getenv("TOP_PRINT_N", "3"))
@@ -236,7 +236,7 @@ def get_support_resistance_info(
 
 
 MAX_OPEN_GAP_TICKS = int(os.getenv("MAX_OPEN_GAP_TICKS", "10"))
-MAX_EARLY_GAIN_FROM_PREV_CLOSE_PCT = float(os.getenv("MAX_EARLY_GAIN_FROM_PREV_CLOSE_PCT", "3.0"))
+MAX_EARLY_DROP_FROM_PREV_CLOSE_PCT = float(os.getenv("MAX_EARLY_DROP_FROM_PREV_CLOSE_PCT", "5.0"))
 
 
 def count_price_ticks(price_a: float, price_b: float, max_count: int = 1000) -> int:
@@ -323,13 +323,11 @@ def opening_gap_check(
 
     gap_ticks = count_price_ticks(previous_close, today_first_open)
 
-    # 做多策略只排除向上跳空過大：今日開盤高於昨末5分K超過10 Tick。
-    # 向下跳空不由此條件排除，仍交由其他多方條件判斷。
-    upward_gap_too_large = (
-        today_first_open > previous_close
+    downward_gap_too_large = (
+        today_first_open < previous_close
         and gap_ticks > MAX_OPEN_GAP_TICKS
     )
-    return not upward_gap_too_large, previous_close, gap_ticks
+    return not downward_gap_too_large, previous_close, gap_ticks
 
 def now_tw() -> datetime:
     return datetime.now(TZ)
@@ -451,10 +449,10 @@ def calc_turnover_100m(close_price: float, total_volume: float) -> float:
 
 def score_candidate(change_rate: float, volume: float, turnover_100m: float, close_price: float, open_price: float) -> int:
     score = 0
-    score += min(30, int(change_rate * 5))
+    score += min(30, max(0, int(abs(change_rate) * 5)))
     score += min(30, int(volume / 3000 * 8))
     score += min(30, int(turnover_100m / 3 * 10))
-    if close_price > open_price:
+    if close_price < open_price:
         score += 10
     return min(score, 100)
 
@@ -616,7 +614,7 @@ def enrich_foreign_info(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]
             "近5日外資買賣超合計(股)": round(recent_total, 0),
             "近5日外資買超天數": recent_buy_days,
             "近期外資有交易": recent_active,
-            "前一日外資買超": previous_net > 0,
+            "前一日外資賣超": previous_net < 0,
         })
 
         if not data_available and FOREIGN_DATA_FAIL_OPEN:
@@ -638,7 +636,7 @@ def format_shares_as_lots(shares: Any) -> str:
 
 def save_candidates(rows: List[Dict[str, Any]]) -> None:
     payload = {
-        "strategy": "Top3Volume_ForeignPreferred_opening_watchlist_v4",
+        "strategy": "ShortBounceFailure_0900_watchlist_v4",
         "generated_at": now_tw().strftime("%Y-%m-%d %H:%M:%S"),
         "count": len(rows),
         "candidates": rows,
@@ -649,9 +647,9 @@ def save_candidates(rows: List[Dict[str, Any]]) -> None:
 
 def format_discord(rows: List[Dict[str, Any]]) -> str:
     if not rows:
-        return "【09:00 最符合策略 TOP 3】本次無符合標的"
+        return "【09:00 做空觀察池】本次無符合標的"
 
-    lines = [f"【09:00 最符合策略 TOP {len(rows)}】量能前三大＋外資優先"]
+    lines = [f"【09:00 最符合策略 TOP {len(rows)}】弱勢股＋外資賣超優先"]
     for i, r in enumerate(rows[:TOP_PRINT_N], 1):
         pressure_distance = r.get("距壓力%")
         support_distance = r.get("距支撐%")
@@ -666,14 +664,15 @@ def format_discord(rows: List[Dict[str, Any]]) -> str:
             else "資料不足"
         )
         lines.extend([
-            f"{i}. 🔶 {r['股票代號']} {r['股票名稱']}｜量能排名 {i}｜量 {int(r['成交量'])}｜漲幅 {r['漲幅']}%｜強度 {r['強度分數']}",
+            f"{i}. 🔻 {r['股票代號']} {r['股票名稱']}｜量能排名 {i}｜量 {int(r['成交量'])}｜漲跌 {r['漲幅']}%｜強度 {r['強度分數']}",
             f"   🌐 前一日外資 {format_shares_as_lots(r.get('前一交易日外資買賣超(股)', 0))}｜近5日合計 {format_shares_as_lots(r.get('近5日外資買賣超合計(股)', 0))}｜買超 {r.get('近5日外資買超天數', 0)} 天",
-            f"   昨末5分K {r.get('昨日最後5分K收盤', '資料不足')}｜今日首根開盤 {r.get('開盤價', '資料不足')}｜向上距離 {r.get('開盤距離Tick', '資料不足')} Tick",
-            f"   09:00相對昨收漲幅 {r.get('09點相對昨收漲幅%', '資料不足')}%（上限 {MAX_EARLY_GAIN_FROM_PREV_CLOSE_PCT}%）",
+            f"   昨末5分K {r.get('昨日最後5分K收盤', '資料不足')}｜今日首根開盤 {r.get('開盤價', '資料不足')}｜跳空距離 {r.get('開盤距離Tick', '資料不足')} Tick",
+            f"   09:00相對昨收漲跌 {r.get('09點相對昨收漲跌%', '資料不足')}%（下限 -{MAX_EARLY_DROP_FROM_PREV_CLOSE_PCT}%）",
             f"   🔻 壓力區 {r.get('近期壓力區', '資料不足')}（距離 {pressure_text}）｜{r.get('空間評估', '')}",
             f"   🔺 支撐區 {r.get('近期支撐區', '資料不足')}（距離 {support_text}）｜20日高低 {r.get('20日最高', '資料不足')}／{r.get('20日最低', '資料不足')}",
         ])
-    lines.append("\n外資觀察最近5個交易日；前一日買超優先。所有固定策略先通過後，才依成交量取3檔。")
+    lines.append("\n⚠️ 僅供觀察；尚未確認券商帳戶先賣後買權限、券源與交易限制。")
+    lines.append("\n外資觀察最近5個交易日；前一日賣超優先。此為觀察名單，非可放空資格確認或進場訊號。")
     return "\n".join(lines)
 
 
@@ -686,7 +685,7 @@ def run() -> None:
 
     api = connect_shioaji()
     contracts = get_stock_contracts(api)
-    print(f"=== 09:00 高周轉活躍池掃描，共 {len(contracts)} 檔 ===")
+    print(f"=== 09:00 做空活躍池掃描，共 {len(contracts)} 檔 ===")
 
     rows: List[Dict[str, Any]] = []
     updated_at = now_tw().strftime("%Y-%m-%d %H:%M:%S")
@@ -705,7 +704,7 @@ def run() -> None:
                 continue
             if total_volume < MIN_VOLUME:
                 continue
-            if close_price <= open_price:
+            if close_price >= open_price:
                 continue
 
             turnover_twd = calc_turnover_twd(close_price, total_volume)
@@ -724,7 +723,7 @@ def run() -> None:
             )
             if not gap_ok:
                 print(
-                    f"排除 {s.code}：今日首根開盤 {open_price} 高於昨日最後5分K收盤 "
+                    f"排除 {s.code}：今日首根開盤 {open_price} 低於昨日最後5分K收盤 "
                     f"{previous_last_close} 超過 {MAX_OPEN_GAP_TICKS} Tick"
                 )
                 continue
@@ -732,10 +731,10 @@ def run() -> None:
             # 09:00 時第一根5分K尚未完成，所以用目前價相對昨末5分K的漲幅做代理。
             if previous_last_close is not None and previous_last_close > 0:
                 early_gain_pct = (close_price - previous_last_close) / previous_last_close * 100
-                if early_gain_pct > MAX_EARLY_GAIN_FROM_PREV_CLOSE_PCT:
+                if early_gain_pct < -MAX_EARLY_DROP_FROM_PREV_CLOSE_PCT:
                     print(
-                        f"排除 {s.code}：09:00早盤漲幅 {early_gain_pct:.2f}% "
-                        f"超過 {MAX_EARLY_GAIN_FROM_PREV_CLOSE_PCT:.2f}%"
+                        f"排除 {s.code}：09:00早盤漲跌 {early_gain_pct:.2f}% "
+                        f"低於 -{MAX_EARLY_DROP_FROM_PREV_CLOSE_PCT:.2f}%"
                     )
                     continue
             else:
@@ -745,16 +744,16 @@ def run() -> None:
             rows.append({
                 "股票代號": s.code,
                 "股票名稱": getattr(contract, "name", ""),
-                "題材": "高成交值活躍池/開盤強勢",
+                "題材": "高成交值活躍池/開盤弱勢",
                 "漲幅": round(change_rate, 2),
                 "成交量": total_volume,
                 "成交值(億)": round(turnover_twd / 100000000, 2),
                 "開盤價": open_price,
                 "昨日最後5分K收盤": round(previous_last_close, 2) if previous_last_close is not None else "資料不足",
                 "開盤距離Tick": opening_gap_ticks if opening_gap_ticks is not None else "資料不足",
-                "09點相對昨收漲幅%": round(early_gain_pct, 2) if early_gain_pct is not None else "資料不足",
+                "09點相對昨收漲跌%": round(early_gain_pct, 2) if early_gain_pct is not None else "資料不足",
                 "目前價": close_price,
-                "是否可當沖": "是",
+                "是否可當沖": "公開契約初篩通過，券商先賣後買資格待確認",
                 "強度分數": score,
                 "更新時間": updated_at,
             })
@@ -764,7 +763,7 @@ def run() -> None:
     rows, foreign_data_available = enrich_foreign_info(rows)
     rows.sort(
         key=lambda r: (
-            1 if r.get("前一日外資買超") else 0,
+            1 if r.get("前一日外資賣超") else 0,
             float(r.get("成交量", 0)),
             float(r.get("成交值(億)", 0)),
             int(r.get("強度分數", 0)),
@@ -805,7 +804,7 @@ def run() -> None:
         print(f"{r['股票代號']} {r['股票名稱']} 漲幅:{r['漲幅']} 量:{r['成交量']} 成交值:{r['成交值(億)']}億 強度:{r['強度分數']}")
 
     discord_send(format_discord(rows))
-    print(f"=== 09:00 Mr.Price 開盤觀察池完成，共 {len(rows)} 檔 ===")
+    print(f"=== 09:00 做空觀察池完成，共 {len(rows)} 檔 ===")
 
 
 if __name__ == "__main__":
